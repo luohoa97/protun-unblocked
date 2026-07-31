@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+#
+# pvpn - simple Proton VPN control for filtered networks.
+#
+#   pvpn up        connect
+#   pvpn down      disconnect
+#   pvpn status    are we connected?
+#   pvpn ip        show current public IP
+#   pvpn login     sign in to your Proton account
+#   pvpn try       try every protocol, stop at the first that works
+#
+# Why this wrapper exists:
+#   * Proton's API is blocked on this network, so account/API traffic is
+#     routed through Tor (torsocks) with an aiodns shim that forces
+#     aiohttp onto its threaded resolver (torsocks cannot proxy UDP DNS).
+#   * `protonvpn connect` installs a full-tunnel route the moment it
+#     STARTS connecting, not when it succeeds. If the tunnel never comes
+#     up, all traffic blackholes until it gives up ~2 minutes later.
+#     Everything below is wrapped so that a failure, a timeout, or Ctrl-C
+#     always restores your normal routing.
+
+set -uo pipefail
+
+SHIM="$HOME/.local/share/protonvpn-torshim"
+SETTINGS="$HOME/.config/Proton/VPN/settings.json"
+LOG="${XDG_RUNTIME_DIR:-/tmp}/pvpn-$$.log"
+
+# How long to wait for a tunnel before giving up and restoring routing.
+#
+# MEASURED on detnsw: successful connects took 36s and 41s. The Stealth
+# handshake itself is only a couple of seconds - the rest is the client
+# attempting its own server-list refresh against Proton's API, which is
+# DNS-blocked here, so it burns ~30s waiting for that to time out before
+# carrying on and connecting anyway.
+#
+# So the earlier 25s cap was killing connects that were about to succeed.
+# 90s gives comfortable headroom over the observed 41s worst case.
+CONNECT_TIMEOUT="${PVPN_TIMEOUT:-30}"
+
+# How long to allow for refreshing Proton's API data over Tor. This is the
+# slow part (serverlist.json is ~2.5 MB) but it happens with routing
+# UNTOUCHED, so it costs you nothing but time.
+REFRESH_TIMEOUT="${PVPN_REFRESH_TIMEOUT:-600}"
+
+# Tried in order by `pvpn try`.
+PROTOCOLS=(protun-tls protun-udp protun-tcp protun-smart openvpn-tcp openvpn-udp wireguard)
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[1m'; X=$'\e[0m'
+else
+    R=''; G=''; Y=''; B=''; X=''
+fi
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s%s%s\n' "$G" "$*" "$X"; }
+warn() { printf '%s%s%s\n' "$Y" "$*" "$X"; }
+err()  { printf '%s%s%s\n' "$R" "$*" "$X" >&2; }
+
+cleanup_log() { rm -f "$LOG"; }
+trap cleanup_log EXIT
+
+# --- plumbing ---------------------------------------------------------
+
+# Proton CLI with its API traffic pushed through Tor.
+# Kept as an ARRAY, not a function: `timeout` execs a real binary and
+# cannot see shell functions, so `timeout ... pv_tor connect` would fail
+# with "failed to run command 'pv_tor': No such file or directory".
+PV_TOR=(torsocks env "PYTHONPATH=$SHIM" PVPN_DEBUG=0 protonvpn)
+pv_tor() { "${PV_TOR[@]}" "$@"; }
+
+# Connecting must NOT go through Tor. The tunnel talks straight to Proton's
+# server IP, which this network does not block; only Proton's API *domains*
+# are blocked. Sending connect through Tor meant the ~2.5 MB serverlist
+# refresh crawled over a Tor circuit while routing was already hijacked -
+# which is what made connects hang for minutes and then fail. With the list
+# cached, a direct connect completes in about ten seconds.
+PV_DIRECT=(env "PYTHONPATH=$SHIM" PVPN_DEBUG=0 protonvpn)
+# Proton CLI for local-only operations (status, disconnect).
+pv()     { protonvpn "$@"; }
+
+need_tor() {
+    if ! systemctl is-active --quiet tor; then
+        err "Tor is not running - Proton's API is blocked without it."
+        say "  Start it with:  sudo systemctl start tor"
+        exit 1
+    fi
+    if ! (exec 3<>/dev/tcp/127.0.0.1/9050) 2>/dev/null; then
+        err "Tor is running but nothing is listening on 127.0.0.1:9050."
+        exit 1
+    fi
+}
+
+need_shim() {
+    if [[ ! -f "$SHIM/aiodns.py" ]]; then
+        mkdir -p "$SHIM"
+        printf 'raise ImportError("aiodns disabled so torsocks can proxy DNS via getaddrinfo")\n' \
+            > "$SHIM/aiodns.py"
+    fi
+}
+
+# NB: must not match "Disconnected", which contains "connected".
+is_connected() { pv status 2>/dev/null | grep -qE 'Status:[[:space:]]*Connected'; }
+
+current_protocol() {
+    [[ -f "$SETTINGS" ]] || { echo "unknown"; return; }
+    /usr/bin/python3 -c "
+import json,sys
+try: print(json.load(open('$SETTINGS')).get('protocol','unknown'))
+except Exception: print('unknown')
+" 2>/dev/null
+}
+
+set_protocol() {
+    local proto="$1"
+    # settings.json only exists once the app has saved something.
+    if [[ ! -f "$SETTINGS" ]]; then
+        pv_tor config set ipv6 on >/dev/null 2>&1
+    fi
+    [[ -f "$SETTINGS" ]] || { err "Could not create $SETTINGS - are you signed in? Try: pvpn login"; exit 1; }
+    /usr/bin/python3 -c "
+import json,pathlib
+p = pathlib.Path('$SETTINGS')
+d = json.loads(p.read_text()); d['protocol'] = '$proto'
+p.write_text(json.dumps(d, indent=2))
+" || { err "Failed to set protocol"; exit 1; }
+}
+
+# Every curl here uses --noproxy '*'. If your shell exports HTTPS_PROXY or
+# ALL_PROXY (e.g. Tor on 9050 for something else), curl would otherwise send
+# these checks through that proxy. Right after the tunnel comes up the proxy's
+# circuits break, the check fails, and pvpn tears down a PERFECTLY GOOD
+# tunnel. Health checks must measure the tunnel, not your proxy.
+CURL=(curl -s --noproxy '*')
+
+# Is the internet actually usable right now?
+# Tries an IP first so a slow DNS switch cannot produce a false negative.
+net_works() {
+    "${CURL[@]}" --max-time 4 -o /dev/null https://1.1.1.1 2>/dev/null && return 0
+    "${CURL[@]}" --max-time 4 -o /dev/null https://cloudflare.com 2>/dev/null
+}
+
+# After a connect, DNS takes a few seconds to move to Proton's resolver.
+# Checking once immediately is what produced "Tunnel came up but no traffic
+# is passing" on a tunnel that was actually fine. Give it a real grace period.
+net_works_settled() {
+    local deadline=$(( SECONDS + ${PVPN_SETTLE:-35} ))
+    while (( SECONDS < deadline )); do
+        net_works && return 0
+        sleep 2
+    done
+    return 1
+}
+
+restore() {
+    # 1. Kill any connect still in flight. The pattern is bracketed so pkill
+    #    cannot match this script's own command line and kill us instead.
+    pkill -f '[p]rotonvpn connect' 2>/dev/null || true
+
+    # 2. Ask Proton to tear down cleanly.
+    pv disconnect >/dev/null 2>&1
+
+    # 3. Proton builds a kill-switch device (pvpnksintrf0 / "pvpn-killswitch")
+    #    while connecting, even with killswitch=0 in settings. If a connect is
+    #    interrupted it can survive and blackhole everything, so remove it by
+    #    hand rather than trusting the client to have cleaned up.
+    while read -r uuid; do
+        [ -n "$uuid" ] && nmcli con delete "$uuid" >/dev/null 2>&1
+    done < <(nmcli -t -f NAME,UUID con show 2>/dev/null \
+               | grep -iE 'killswitch|pvpnks' | cut -d: -f2)
+    ip link show pvpnksintrf0 >/dev/null 2>&1 && \
+        sudo ip link delete pvpnksintrf0 >/dev/null 2>&1
+
+    # 4. Wait for traffic to flow again.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        net_works && return 0
+        sleep 1
+    done
+
+    # 5. Last resort: bounce the wifi. Recovers the case where the interface
+    #    is left half-configured (e.g. after a suspend mid-connect).
+    local w
+    w=$(nmcli -t -f NAME,TYPE con show --active 2>/dev/null \
+          | awk -F: '$2=="802-11-wireless"{print $1; exit}')
+    if [ -n "$w" ]; then
+        nmcli con up "$w" >/dev/null 2>&1
+        for _ in 1 2 3 4 5; do net_works && return 0; sleep 1; done
+    fi
+    return 1
+}
+
+# Can we reach Proton's API directly? This is the difference between an
+# ordinary network and a filtered one, and it decides everything below.
+# Cheap: one HEAD request with a short deadline.
+api_reachable() {
+    "${CURL[@]}" --max-time 4 -o /dev/null https://vpn-api.proton.me/tests/ping 2>/dev/null
+}
+
+# MEASURED cost of a connect on a filtered network (debug trace, 2026-07-31):
+#   /vpn/v1/logicals    -> "No working transports found" after exactly 15.0s
+#   /vpn/v2/clientconfig-> "No working transports found" after exactly 15.0s
+#   CONN.CONNECT:START  -> Connected in 0.3s
+# The tunnel is nearly instant; 30s is two doomed API calls timing out.
+#
+# PVPN_FAST=1 points those two hostnames at 127.0.0.1 for the duration of
+# the connect, so they fail in milliseconds instead of 15s each - roughly a
+# 3s connect. It needs sudo to edit /etc/hosts and always removes its own
+# block again, including on Ctrl-C. Off by default: it is a real edit to a
+# system file, so you opt in.
+HOSTS_MARK="# pvpn-temporary-api-blackhole"
+blackhole_api() {
+    [[ "${PVPN_FAST:-0}" = 1 ]] || return 0
+    api_reachable && return 0          # unfiltered network: never do this
+    sudo sh -c "printf '%s\n127.0.0.1 vpn-api.proton.me\n127.0.0.1 api.protonvpn.ch\n127.0.0.1 account.proton.me\n' '$HOSTS_MARK' >> /etc/hosts" \
+        2>/dev/null && BLACKHOLED=1
+}
+unblackhole_api() {
+    [[ "${BLACKHOLED:-0}" = 1 ]] || return 0
+    sudo sed -i "/${HOSTS_MARK#\# }/,+3d" /etc/hosts 2>/dev/null
+    sudo sed -i '/127\.0\.0\.1 vpn-api\.proton\.me/d;/127\.0\.0\.1 api\.protonvpn\.ch/d;/127\.0\.0\.1 account\.proton\.me/d' /etc/hosts 2>/dev/null
+    BLACKHOLED=0
+}
+
+# Proton's API domains are blocked here, so refreshing its cached data needs
+# Tor. serverlist.json is ~2.5 MB and can take minutes over a Tor circuit -
+# but this runs with routing untouched, so your connection keeps working the
+# whole time. Only refresh when the cache is actually stale.
+SERVERLIST="$HOME/.cache/Proton/VPN/serverlist.json"
+STALE_HOURS="${PVPN_STALE_HOURS:-24}"
+
+ensure_fresh_data() {
+    local age_h=99999
+    if [[ -s $SERVERLIST ]]; then
+        age_h=$(( ( $(date +%s) - $(stat -c %Y "$SERVERLIST") ) / 3600 ))
+    fi
+    if (( age_h < STALE_HOURS )); then
+        say "Server list is ${age_h}h old - no refresh needed."
+        return 0
+    fi
+
+    need_tor
+    warn "Server list is stale. Refreshing over Tor first (routing untouched,"
+    warn "so your internet keeps working). This can take a few minutes once."
+    if timeout "$REFRESH_TIMEOUT" "${PV_TOR[@]}" servers >/dev/null 2>&1 && [[ -s $SERVERLIST ]]; then
+        ok "Server list cached ($(( $(stat -c %s "$SERVERLIST") / 1024 )) KB)."
+    else
+        warn "Refresh failed or timed out. Trying to connect with what we have."
+    fi
+}
+
+# --- commands ---------------------------------------------------------
+
+cmd_up() {
+    local proto="${1:-}"
+    # Deliberately NOT need_tor here. Connecting goes straight to Proton's
+    # server IP and works with Tor stopped. Tor is only required if the
+    # cached server list has gone stale, and ensure_fresh_data checks it
+    # there. Demanding Tor up front would refuse a connect that would
+    # otherwise have succeeded.
+    need_shim
+
+    if is_connected; then
+        ok "Already connected."; cmd_status; return 0
+    fi
+
+    [[ -n "$proto" ]] && set_protocol "$proto"
+    proto="$(current_protocol)"
+
+    # Do the slow API work FIRST, while routing is still untouched. If the
+    # server list is stale, connect would try to refresh it mid-connect with
+    # your traffic already pointed into a tunnel that isn't up yet.
+    ensure_fresh_data
+
+    # Adapt to the network instead of assuming the worst everywhere.
+    if api_reachable; then
+        say "Proton's API is reachable - normal network, this will be quick."
+        CONNECT_TIMEOUT="${PVPN_TIMEOUT:-30}"
+    else
+        blackhole_api
+        if [[ "${BLACKHOLED:-0}" = 1 ]]; then
+            say "Filtered network - API blackholed for this connect (fast path)."
+            CONNECT_TIMEOUT="${PVPN_TIMEOUT:-30}"
+        else
+            # lib/sitecustomize.py already cut AutoTransport.TRANSPORT_TIMEOUT
+            # from 15s to PVPN_API_TIMEOUT (default 2), so the two doomed API
+            # refreshes cost ~4s here rather than the stock 30s.
+            say "Filtered network - API calls will fail fast (${PVPN_API_TIMEOUT:-2}s each)."
+        fi
+    fi
+
+    warn "Connecting via ${proto} - your internet will stall for up to ${CONNECT_TIMEOUT}s."
+    say  "(that is normal: the route moves into the tunnel before it is up)"
+
+    # Ctrl-C or any early exit must put routing back - and must always undo
+    # the /etc/hosts edit, or the API would stay broken after we exit.
+    trap 'echo; warn "Interrupted - restoring your connection..."; unblackhole_api; restore; cleanup_log; exit 130' INT TERM
+
+    # A free account cannot choose its server - Proton assigns one per
+    # connect, and OBSERVED BEHAVIOUR is that some are duds: the tunnel
+    # reports Connected but never passes traffic, while the very next
+    # attempt lands on a different server and works. Miami and Tokyo both
+    # worked today; another did not. So retry - each attempt is a fresh
+    # roll of the dice, not a repeat of the same failure.
+    local attempts="${PVPN_ATTEMPTS:-3}" rc=0 n=0
+    while (( n < attempts )); do
+        (( n++ ))
+        (( n > 1 )) && { say "Attempt ${n}/${attempts} - asking for a different server..."
+                         pv disconnect >/dev/null 2>&1; sleep 2; }
+
+        rc=0
+        timeout "$CONNECT_TIMEOUT" "${PV_DIRECT[@]}" connect >"$LOG" 2>&1 || rc=$?
+        # Undo the hosts edit the moment the connect is over, whatever
+        # happened. Once the tunnel is up the API is reachable through it.
+        unblackhole_api
+
+        if [[ $rc -eq 0 ]] && is_connected; then
+            local where; where=$(grep -oE 'Connected to [^.]*' "$LOG" | head -1)
+            say "  ${where:-tunnel up} - checking traffic..."
+            if net_works_settled; then
+                trap cleanup_log EXIT INT TERM
+                ok "Connected via ${proto}."
+                cmd_ip
+                return 0
+            fi
+            warn "That server came up but passes no traffic."
+        else
+            err "Could not connect via ${proto} (timed out or refused)."
+            grep -iE 'error|failed|not available|free plan' "$LOG" | tail -2
+            # A hard refusal (free-plan limit, bad protocol) will not fix
+            # itself on retry, so stop rather than burn three attempts.
+            grep -qiE 'not available on the free plan|Missing username' "$LOG" && break
+        fi
+    done
+    trap cleanup_log EXIT INT TERM
+
+    trap cleanup_log EXIT INT TERM
+    warn "Restoring your normal connection..."
+    if restore; then ok "Internet restored."; else err "Internet still down - try: pvpn down"; fi
+    return 1
+}
+
+cmd_down() {
+    pv disconnect >/dev/null 2>&1
+    if restore; then ok "Disconnected. Internet is working."
+    else warn "Disconnected, but the network looks down. Try: nmcli con up detnsw"; fi
+}
+
+cmd_status() {
+    local s; s="$(pv status 2>/dev/null | head -3)"
+    say "${s:-Status: unknown}"
+    say "Protocol: $(current_protocol)"
+}
+
+cmd_ip() {
+    local ip; ip="$("${CURL[@]}" --max-time 10 https://ifconfig.me 2>/dev/null)"
+    say "Public IP: ${ip:-<unavailable>}"
+}
+
+cmd_login() {
+    need_tor; need_shim
+    local user="${1:-}"
+    if [[ -z "$user" ]]; then
+        read -r -p "Proton account email (e.g. you@proton.me): " user
+    fi
+    # debug-signin.py masks the password with dots as you type.
+    if [[ -f "$SHIM/debug-signin.py" ]]; then
+        torsocks env PYTHONPATH="$SHIM" PVPN_DEBUG=0 \
+            /usr/bin/python3 "$SHIM/debug-signin.py" signin "$user"
+    else
+        pv_tor signin "$user"
+    fi
+}
+
+cmd_logout() { pv_tor signout; }
+
+cmd_try() {
+    need_tor; need_shim
+    warn "Trying each protocol in turn. Your internet will stall in bursts."
+    for p in "${PROTOCOLS[@]}"; do
+        say ""
+        say "${B}--- trying ${p} ---${X}"
+        if cmd_up "$p"; then
+            ok "Success with ${p}. It is now saved as your default."
+            return 0
+        fi
+    done
+    say ""
+    err "No protocol worked on this network."
+    say "This network blocks every Proton transport we can reach."
+    say "Tor still works: prefix any command with 'torsocks', or use Tor Browser."
+    return 1
+}
+
+usage() {
+    cat <<'EOF'
+pvpn - simple Proton VPN control
+
+  pvpn up [protocol]   connect (optionally forcing a protocol)
+  pvpn down            disconnect and restore normal internet
+  pvpn status          show connection state and protocol
+  pvpn ip              show your current public IP
+  pvpn login [email]   sign in to your Proton account
+  pvpn logout          sign out
+  pvpn try             try every protocol, stop at the first that works
+  pvpn help            this message
+
+Protocols: protun-tls (Stealth), protun-udp, protun-tcp, protun-smart,
+           openvpn-tcp, openvpn-udp, wireguard
+
+Notes:
+  Connecting stalls your internet for ~10s (PVPN_TIMEOUT to change).
+  If it fails, times out, or you press Ctrl-C, your connection is restored
+  automatically. If anything ever seems stuck, run:  pvpn down
+EOF
+}
+
+case "${1:-help}" in
+    up|connect)      shift; cmd_up "${1:-}" ;;
+    down|disconnect) cmd_down ;;
+    status|st)       cmd_status ;;
+    ip)              cmd_ip ;;
+    login|signin)    shift; cmd_login "${1:-}" ;;
+    logout|signout)  cmd_logout ;;
+    try)             cmd_try ;;
+    help|-h|--help)  usage ;;
+    *)               err "Unknown command: $1"; say ""; usage; exit 1 ;;
+esac
