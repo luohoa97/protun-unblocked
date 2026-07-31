@@ -84,7 +84,7 @@ before you spend time on the client.
 | variable | default | meaning |
 |---|---|---|
 | `PVPN_TIMEOUT` | 30 | seconds to wait for a tunnel |
-| `PVPN_SETTLE` | 35 | grace period for traffic to start |
+| `PVPN_SETTLE` | 20 | grace period for traffic to start |
 | `PVPN_ATTEMPTS` | 3 | connect attempts (new server each time) |
 | `PVPN_API_TIMEOUT` | 2 | Proton API transport timeout |
 | `PVPN_FAST` | 0 | blackhole the API in `/etc/hosts` for the connect (needs sudo) |
