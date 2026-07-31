@@ -133,20 +133,37 @@ p.write_text(json.dumps(d, indent=2))
 CURL=(curl -s --noproxy '*')
 
 # Is the internet actually usable right now?
-# Tries an IP first so a slow DNS switch cannot produce a false negative.
+#
+# Probe choice matters more than it looks. The obvious "curl https://1.1.1.1"
+# is WRONG on a filtered network: measured here it returns 000 after burning
+# the FULL timeout, both inside and outside a working tunnel, because the
+# network drops it. Every health check then cost 4-8s before falling through,
+# which made connects crawl and made a good tunnel look dead.
+#
+# These are small, unauthenticated, 204/200 endpoints that answered in under
+# half a second through the tunnel. -4 because the tunnel may advertise IPv6
+# DNS while installing no IPv6 route.
+NET_PROBES=(
+    "http://connectivitycheck.gstatic.com/generate_204"
+    "http://detectportal.firefox.com/success.txt"
+    "https://cloudflare.com"
+)
 net_works() {
-    "${CURL[@]}" --max-time 4 -o /dev/null https://1.1.1.1 2>/dev/null && return 0
-    "${CURL[@]}" --max-time 4 -o /dev/null https://cloudflare.com 2>/dev/null
+    local u
+    for u in "${NET_PROBES[@]}"; do
+        "${CURL[@]}" -4 --max-time 3 -o /dev/null "$u" 2>/dev/null && return 0
+    done
+    return 1
 }
 
 # After a connect, DNS takes a few seconds to move to Proton's resolver.
 # Checking once immediately is what produced "Tunnel came up but no traffic
 # is passing" on a tunnel that was actually fine. Give it a real grace period.
 net_works_settled() {
-    local deadline=$(( SECONDS + ${PVPN_SETTLE:-35} ))
+    local deadline=$(( SECONDS + ${PVPN_SETTLE:-20} ))
     while (( SECONDS < deadline )); do
         net_works && return 0
-        sleep 2
+        sleep 1
     done
     return 1
 }

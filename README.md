@@ -43,7 +43,7 @@ Every check here uses `curl --noproxy '*'`.
 ## Install
 
 ```bash
-git clone https://github.com/YOURNAME/pvpn.git && cd pvpn && ./setup.sh
+git clone https://github.com/luohoa97/protun-unblocked.git && cd protun-unblocked && ./setup.sh
 ```
 
 Installs only under `$HOME`. `./setup.sh --uninstall` removes it. You need
