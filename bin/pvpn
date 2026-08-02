@@ -156,11 +156,18 @@ net_works() {
     return 1
 }
 
-# After a connect, DNS takes a few seconds to move to Proton's resolver.
-# Checking once immediately is what produced "Tunnel came up but no traffic
-# is passing" on a tunnel that was actually fine. Give it a real grace period.
+# After a connect, a tunnel can take a while to pass its first packet -
+# 12s in one measurement, and OBSERVED over 20s on US-FREE#15, which was
+# torn down as a "dud" and then worked on the very next attempt with the
+# SAME server. Tearing down a tunnel that is merely slow is the worst
+# outcome: it costs a full reconnect and lands you right back where you
+# were.
+#
+# A long window is nearly free now that each probe returns in ~0.3s: this
+# loop exits the moment traffic flows, so the timeout is only ever paid by
+# a genuinely dead tunnel. Prefer waiting over retrying.
 net_works_settled() {
-    local deadline=$(( SECONDS + ${PVPN_SETTLE:-20} ))
+    local deadline=$(( SECONDS + ${PVPN_SETTLE:-45} ))
     while (( SECONDS < deadline )); do
         net_works && return 0
         sleep 1
@@ -311,16 +318,21 @@ cmd_up() {
     # the /etc/hosts edit, or the API would stay broken after we exit.
     trap 'echo; warn "Interrupted - restoring your connection..."; unblackhole_api; restore; cleanup_log; exit 130' INT TERM
 
-    # A free account cannot choose its server - Proton assigns one per
-    # connect, and OBSERVED BEHAVIOUR is that some are duds: the tunnel
-    # reports Connected but never passes traffic, while the very next
-    # attempt lands on a different server and works. Miami and Tokyo both
-    # worked today; another did not. So retry - each attempt is a fresh
-    # roll of the dice, not a repeat of the same failure.
+    # Retries are a LAST resort, not the main mechanism.
+    #
+    # CORRECTION to an earlier assumption: retrying does NOT reliably get a
+    # different server. Observed: two consecutive attempts both landed on
+    # US-FREE#15 (Dallas), the first "failing" only because the settle
+    # window was too short. So the fix for a slow tunnel is a longer
+    # PVPN_SETTLE, not another attempt - a reconnect just repeats the same
+    # handshake against the same host.
+    #
+    # Attempts remain for the case where a server really is dead, since
+    # Proton sometimes does hand out a different one.
     local attempts="${PVPN_ATTEMPTS:-3}" rc=0 n=0
     while (( n < attempts )); do
         (( n++ ))
-        (( n > 1 )) && { say "Attempt ${n}/${attempts} - asking for a different server..."
+        (( n > 1 )) && { say "Attempt ${n}/${attempts} - reconnecting (may be the same server)..."
                          pv disconnect >/dev/null 2>&1; sleep 2; }
 
         rc=0

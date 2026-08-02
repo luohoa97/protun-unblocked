@@ -65,13 +65,18 @@ before you spend time on the client.
 
 ## What it handles
 
+- **Slow settling — the big one.** A tunnel can take a long time to pass its
+  first packet: 12s in one measurement, and **over 20s** on US-FREE#15, which
+  a short window wrote off as dead. It then worked on the next attempt using
+  *the same server*. So `PVPN_SETTLE` defaults to 45s. That costs nothing when
+  things work — probes return in ~0.3s and the loop exits the instant traffic
+  flows — and only a dead tunnel ever pays it. **Don't lower it to "make
+  connects fast"; that just discards tunnels that were about to work.**
 - **Free-tier server roulette.** Free accounts cannot pick a server — both
-  `--country` and by-ID are refused. Proton assigns one per connect and **some
-  duds come up "Connected" but pass no traffic**. `pvpn up` retries (default 3),
-  and each retry gets a different server.
-- **Slow settling.** A working tunnel took **12s** to pass its first packet in
-  testing, so the health check has a real grace window instead of failing
-  instantly. Don't lower `PVPN_SETTLE` below ~15s or you'll abandon good tunnels.
+  `--country` and by-ID are refused. `pvpn up` retries (default 3) in case a
+  server really is dead, but note that retrying does **not** reliably get you
+  a different one: two consecutive attempts were observed landing on the same
+  server. Waiting beats retrying.
 - **Stray kill-switch.** Proton creates `pvpnksintrf0` while connecting even
   with the kill switch off. An interrupted connect can leave it behind,
   blackholing everything. `pvpn down` removes it explicitly.
@@ -84,7 +89,7 @@ before you spend time on the client.
 | variable | default | meaning |
 |---|---|---|
 | `PVPN_TIMEOUT` | 30 | seconds to wait for a tunnel |
-| `PVPN_SETTLE` | 20 | grace period for traffic to start |
+| `PVPN_SETTLE` | 45 | grace period for traffic to start (cheap: exits as soon as traffic flows) |
 | `PVPN_ATTEMPTS` | 3 | connect attempts (new server each time) |
 | `PVPN_API_TIMEOUT` | 2 | Proton API transport timeout |
 | `PVPN_FAST` | 0 | blackhole the API in `/etc/hosts` for the connect (needs sudo) |
