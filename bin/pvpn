@@ -3,6 +3,7 @@
 # pvpn - simple Proton VPN control for filtered networks.
 #
 #   pvpn up        connect
+#   pvpn hop       move to a different server
 #   pvpn down      disconnect
 #   pvpn status    are we connected?
 #   pvpn ip        show current public IP
@@ -33,8 +34,9 @@ LOG="${XDG_RUNTIME_DIR:-/tmp}/pvpn-$$.log"
 # DNS-blocked here, so it burns ~30s waiting for that to time out before
 # carrying on and connecting anyway.
 #
-# So the earlier 25s cap was killing connects that were about to succeed.
-# 90s gives comfortable headroom over the observed 41s worst case.
+# With lib/sitecustomize.py lowering the API transport timeout to 2s, that
+# 30s of doomed API calls collapses to ~4s and a connect lands in ~10s.
+# 30s is therefore ample; raise PVPN_TIMEOUT if you disable the shim.
 CONNECT_TIMEOUT="${PVPN_TIMEOUT:-30}"
 
 # How long to allow for refreshing Proton's API data over Tor. This is the
@@ -96,6 +98,11 @@ need_shim() {
         printf 'raise ImportError("aiodns disabled so torsocks can proxy DNS via getaddrinfo")\n' \
             > "$SHIM/aiodns.py"
     fi
+}
+
+# Which server are we on right now? Empty if disconnected.
+current_server() {
+    pv status 2>/dev/null | sed -n 's/^Server:[[:space:]]*//p' | head -1
 }
 
 # NB: must not match "Disconnected", which contains "connected".
@@ -163,11 +170,17 @@ net_works() {
 # outcome: it costs a full reconnect and lands you right back where you
 # were.
 #
-# A long window is nearly free now that each probe returns in ~0.3s: this
-# loop exits the moment traffic flows, so the timeout is only ever paid by
-# a genuinely dead tunnel. Prefer waiting over retrying.
+# Three measurements of "time until the first packet gets through":
+#     12s   (one server)
+#     >20s  (US-FREE#15  - torn down at 20s, worked on the next try)
+#     >45s  (JP-FREE#1   - torn down at 45s, was working seconds later)
+#
+# Every tunnel written off as dead turned out to be alive. So the window is
+# 90s, and running out of it NO LONGER tears the tunnel down - see cmd_up.
+# A long window is nearly free: each probe returns in ~0.3s and the loop
+# exits the instant traffic flows.
 net_works_settled() {
-    local deadline=$(( SECONDS + ${PVPN_SETTLE:-45} ))
+    local deadline=$(( SECONDS + ${PVPN_SETTLE:-90} ))
     while (( SECONDS < deadline )); do
         net_works && return 0
         sleep 1
@@ -273,6 +286,126 @@ ensure_fresh_data() {
 
 # --- commands ---------------------------------------------------------
 
+# --- server steering ------------------------------------------------
+#
+# A free account cannot choose a server. Every documented mechanism is
+# refused outright:
+#
+#   protonvpn connect --country US   -> "not available on the free plan"
+#   protonvpn connect --random       -> "not available on the free plan"
+#   protonvpn connect US-FREE#15     -> "not available on the free plan"
+#
+# and a plain reconnect is not random either: six consecutive attempts all
+# returned US-FREE#15. Brute force does not work.
+#
+# What does work: the client picks from its LOCAL cache. Mark the servers
+# you do not want as Status=0 (offline) in serverlist.json and it picks
+# something else. VERIFIED: with US-FREE#15 marked offline it went straight
+# to SG-FREE#12 in Singapore, first try.
+#
+# The cache is Proton's own data, so we always put it back - on success,
+# failure, or Ctrl-C. It is also refetched periodically, so an edit that
+# somehow survived would be corrected anyway.
+SERVERLIST="$HOME/.cache/Proton/VPN/serverlist.json"
+CACHE_BAK=""
+
+restore_cache() {
+    [[ -n "$CACHE_BAK" && -f "$CACHE_BAK" ]] || return 0
+    mv -f "$CACHE_BAK" "$SERVERLIST" 2>/dev/null
+    CACHE_BAK=""
+}
+
+# steer_cache <mode> <pattern>
+#   exclude <name>    - hide exactly this server
+#   only    <pattern> - hide every free server NOT matching (case-insensitive)
+steer_cache() {
+    local mode="$1" pat="$2"
+    [[ -s "$SERVERLIST" ]] || { err "No cached server list. Run: pvpn up"; return 1; }
+    CACHE_BAK="${SERVERLIST}.pvpn-bak"
+    cp -f "$SERVERLIST" "$CACHE_BAK" || { CACHE_BAK=""; return 1; }
+
+    MODE="$mode" PAT="$pat" SL="$SERVERLIST" /usr/bin/python3 - <<'PYEOF'
+import json, os, sys, pathlib
+mode, pat = os.environ["MODE"], os.environ["PAT"].upper()
+p = pathlib.Path(os.environ["SL"])
+d = json.loads(p.read_text())
+key = "LogicalServers" if "LogicalServers" in d else "Servers"
+kept = hidden = 0
+for srv in d[key]:
+    name = (srv.get("Name") or "").upper()
+    if "FREE" not in name:
+        continue                      # paid servers are unreachable to us anyway
+    match = pat in name
+    hide = match if mode == "exclude" else not match
+    if hide:
+        srv["Status"] = 0
+        hidden += 1
+    else:
+        kept += 1
+if kept == 0:
+    sys.stderr.write("no free server matches that pattern\n")
+    sys.exit(2)
+p.write_text(json.dumps(d))
+print(f"{kept} candidate server(s), {hidden} hidden")
+PYEOF
+}
+
+# Move to a different server, optionally a specific one.
+#
+#   pvpn hop            any server other than the current one
+#   pvpn hop JP         any Japanese free server
+#   pvpn hop SG-FREE#12 that exact server
+cmd_hop() {
+    need_shim
+    local want="${1:-}" before after rc
+
+    before="$(current_server)"
+    [[ -n "$before" ]] && say "Currently on: $before"
+
+    if [[ -n "$want" ]]; then
+        say "Target: servers matching '${want}'"
+        steer_cache only "$want" || { restore_cache; return 1; }
+    else
+        [[ -n "$before" ]] || { warn "Not connected - just connecting."; cmd_up; return $?; }
+        # status prints "NAME in City, Country"; the cache holds only NAME.
+        steer_cache exclude "${before%% in *}" || { restore_cache; return 1; }
+    fi
+
+    trap 'echo; warn "Interrupted - restoring..."; restore_cache; restore; cleanup_log; exit 130' INT TERM
+
+    pv disconnect >/dev/null 2>&1
+    sleep 2
+    rc=0
+    timeout "$CONNECT_TIMEOUT" "${PV_DIRECT[@]}" connect >"$LOG" 2>&1 || rc=$?
+    # Put Proton's data back before doing anything else.
+    restore_cache
+
+    if (( rc != 0 )) || ! is_connected; then
+        err "Hop failed to connect."
+        grep -iE 'error|failed|not available' "$LOG" | tail -2
+        trap cleanup_log EXIT INT TERM
+        warn "Restoring your normal connection..."
+        restore && ok "Internet restored." || err "Still down - try: pvpn down"
+        return 1
+    fi
+
+    after="$(current_server)"
+    say "  landed on ${after} - checking traffic..."
+    if net_works_settled; then
+        trap cleanup_log EXIT INT TERM
+        ok "Hopped${before:+: ${before%% in *} ->} ${after}"
+        cmd_ip
+        return 0
+    fi
+
+    trap cleanup_log EXIT INT TERM
+    warn "${after} has not passed traffic yet after ${PVPN_SETTLE:-90}s."
+    warn "Keeping it - slow starts are normal here and it may come good."
+    say  "  check with:  pvpn status   |   move on with:  pvpn hop   |   stop:  pvpn down"
+    cmd_ip
+    return 0
+}
+
 cmd_up() {
     local proto="${1:-}"
     # Deliberately NOT need_tor here. Connecting goes straight to Proton's
@@ -350,7 +483,15 @@ cmd_up() {
                 cmd_ip
                 return 0
             fi
-            warn "That server came up but passes no traffic."
+            # Do NOT tear this down. Every tunnel we ever declared dead was
+        # simply slow, and demolishing it costs a full reconnect and often
+        # lands on the same server anyway. Keep it and say so plainly.
+        warn "No traffic yet after ${PVPN_SETTLE:-90}s. Keeping the tunnel:"
+        warn "  in testing these have come good shortly afterwards."
+        say  "  check with:  pvpn status   |   give up with:  pvpn down"
+        trap cleanup_log EXIT INT TERM
+        cmd_ip
+        return 0
         else
             err "Could not connect via ${proto} (timed out or refused)."
             grep -iE 'error|failed|not available|free plan' "$LOG" | tail -2
@@ -424,6 +565,7 @@ usage() {
 pvpn - simple Proton VPN control
 
   pvpn up [protocol]   connect (optionally forcing a protocol)
+  pvpn hop [match]     switch server; optionally one matching e.g. JP, SG-FREE#12
   pvpn down            disconnect and restore normal internet
   pvpn status          show connection state and protocol
   pvpn ip              show your current public IP
@@ -435,6 +577,16 @@ pvpn - simple Proton VPN control
 Protocols: protun-tls (Stealth), protun-udp, protun-tcp, protun-smart,
            openvpn-tcp, openvpn-udp, wireguard
 
+`hop` works around the free plan having no server selection (--country,
+--random and by-ID are all refused, and reconnecting returned the SAME
+server 6 times running). It temporarily marks the servers you do not want
+as offline in Proton's local cache, connects, then restores the cache -
+always, including on Ctrl-C.
+
+  pvpn hop            anything but the current server
+  pvpn hop JP         a Japanese server
+  pvpn hop SG-FREE#12 that exact one
+
 Notes:
   Connecting stalls your internet for ~10s (PVPN_TIMEOUT to change).
   If it fails, times out, or you press Ctrl-C, your connection is restored
@@ -444,6 +596,7 @@ EOF
 
 case "${1:-help}" in
     up|connect)      shift; cmd_up "${1:-}" ;;
+    hop|next)        shift; cmd_hop "${1:-}" ;;
     down|disconnect) cmd_down ;;
     status|st)       cmd_status ;;
     ip)              cmd_ip ;;

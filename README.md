@@ -65,18 +65,18 @@ before you spend time on the client.
 
 ## What it handles
 
-- **Slow settling — the big one.** A tunnel can take a long time to pass its
-  first packet: 12s in one measurement, and **over 20s** on US-FREE#15, which
-  a short window wrote off as dead. It then worked on the next attempt using
-  *the same server*. So `PVPN_SETTLE` defaults to 45s. That costs nothing when
-  things work — probes return in ~0.3s and the loop exits the instant traffic
-  flows — and only a dead tunnel ever pays it. **Don't lower it to "make
-  connects fast"; that just discards tunnels that were about to work.**
-- **Free-tier server roulette.** Free accounts cannot pick a server — both
-  `--country` and by-ID are refused. `pvpn up` retries (default 3) in case a
-  server really is dead, but note that retrying does **not** reliably get you
-  a different one: two consecutive attempts were observed landing on the same
-  server. Waiting beats retrying.
+- **Slow settling — the big one.** Time until a tunnel passes its first
+  packet, measured on three servers: **12s**, **>20s**, **>45s**. Every single
+  tunnel that got written off as dead turned out to be alive moments later. So
+  `PVPN_SETTLE` is 90s, and — more importantly — **running out of it no longer
+  tears the tunnel down.** It keeps the connection, tells you traffic hasn't
+  started, and leaves `pvpn down` to you. Discarding a slow tunnel costs a full
+  reconnect and often lands on the same server anyway.
+- **No server selection on free.** `--country`, `--random` and by-ID are all
+  refused, and reconnecting is not random: **six consecutive attempts returned
+  US-FREE#15.** `pvpn hop` gets around this by temporarily marking unwanted
+  servers offline in Proton's local cache, then restoring it. Verified: Dallas
+  → Singapore, and Dallas → Tokyo with `pvpn hop JP`, each on the first try.
 - **Stray kill-switch.** Proton creates `pvpnksintrf0` while connecting even
   with the kill switch off. An interrupted connect can leave it behind,
   blackholing everything. `pvpn down` removes it explicitly.
@@ -89,7 +89,7 @@ before you spend time on the client.
 | variable | default | meaning |
 |---|---|---|
 | `PVPN_TIMEOUT` | 30 | seconds to wait for a tunnel |
-| `PVPN_SETTLE` | 45 | grace period for traffic to start (cheap: exits as soon as traffic flows) |
+| `PVPN_SETTLE` | 90 | grace period for traffic to start (exits as soon as traffic flows) |
 | `PVPN_ATTEMPTS` | 3 | connect attempts (new server each time) |
 | `PVPN_API_TIMEOUT` | 2 | Proton API transport timeout |
 | `PVPN_FAST` | 0 | blackhole the API in `/etc/hosts` for the connect (needs sudo) |
