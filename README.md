@@ -107,4 +107,19 @@ before you spend time on the client.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+**GPL-3.0-or-later** — see [LICENSE](LICENSE).
+
+This is copyleft. If you distribute this code, or anything derived from it,
+you must:
+
+- release it under GPL-3.0-or-later as well — you cannot make it closed source
+- provide the complete corresponding **source**
+- keep the copyright notices intact
+- state what you changed
+
+Note that this applies to *distribution*. Running it privately, or modifying it
+for your own use, carries no obligation.
+
+Versions released before commit `f77ec1e` were published under MIT. That grant
+cannot be revoked for those copies — anyone who took the code under MIT keeps
+MIT terms for that version. The copyleft applies from this commit onward.
