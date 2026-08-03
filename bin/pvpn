@@ -26,6 +26,7 @@
 #   pvpn status    are we connected?
 #   pvpn ip        show current public IP
 #   pvpn login     sign in to your Proton account
+#   pvpn account   view or log out of the Proton account
 #   pvpn try       try every protocol, stop at the first that works
 #
 # Why this wrapper exists:
@@ -40,7 +41,9 @@
 
 set -uo pipefail
 
-SHIM="$HOME/.local/share/protonvpn-torshim"
+SHIM="${PVPN_SHIM:-$HOME/.local/share/pvpn}"
+# Backward-compatible fallback if an older install path still exists.
+[[ -d "$SHIM" ]] || SHIM="$HOME/.local/share/protonvpn-torshim"
 SETTINGS="$HOME/.config/Proton/VPN/settings.json"
 LOG="${XDG_RUNTIME_DIR:-/tmp}/pvpn-$$.log"
 
@@ -73,8 +76,10 @@ fi
 
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '%s%s%s\n' "$G" "$*" "$X"; }
-warn() { printf '%s%s%s\n' "$Y" "$*" "$X"; }
+# warn/note/err → stderr so $(ensure_connect_protocol) never captures them.
+warn() { printf '%s%s%s\n' "$Y" "$*" "$X" >&2; }
 err()  { printf '%s%s%s\n' "$R" "$*" "$X" >&2; }
+note() { printf '  %s\n' "$*" >&2; }
 
 cleanup_log() { rm -f "$LOG"; }
 trap cleanup_log EXIT
@@ -146,8 +151,104 @@ set_protocol() {
 import json,pathlib
 p = pathlib.Path('$SETTINGS')
 d = json.loads(p.read_text()); d['protocol'] = '$proto'
-p.write_text(json.dumps(d, indent=2))
+p.write_text(json.dumps(d, indent=2) + '\n')
 " || { err "Failed to set protocol"; exit 1; }
+}
+
+# True if Proton's registry has a *valid* implementation for this protocol.
+# Stealth (protun-*) needs the NetworkManager "protun" plugin + python3-proton-vpn-lib;
+# without those, connect dies instantly with "No valid implementation found".
+protocol_available() {
+    local proto="$1"
+    /usr/bin/python3 - "$proto" <<'PY' 2>/dev/null
+import importlib, sys
+proto = sys.argv[1]
+from proton.vpn.core.registry import Registry
+r = Registry()
+for mod in (
+    "proton.vpn.backend.networkmanager.protocol.openvpn",
+    "proton.vpn.backend.networkmanager.protocol.wireguard",
+    "proton.vpn.backend.networkmanager.protocol.protun",
+):
+    try:
+        importlib.import_module(mod).register(r)
+    except Exception:
+        pass
+cls = r._registry.get(proto)
+sys.exit(0 if cls is not None and cls.validate() else 1)
+PY
+}
+
+# Primary protocol is Stealth (protun-tls). OpenVPN-TCP is the last-resort
+# fallback when the NM protun plugin is missing. Note this is NOT about
+# usually fails anyway.
+# IMPORTANT: only the final protocol name goes to stdout (callers capture $()).
+ensure_connect_protocol() {
+    local want="$1" fallback="openvpn-tcp"
+    if [[ -z "$want" || "$want" == "unknown" ]]; then
+        want="protun-tls"
+    fi
+    if protocol_available "$want"; then
+        set_protocol "$want"
+        printf '%s\n' "$want"
+        return 0
+    fi
+    # Always try Stealth before falling back, even if settings asked for
+    # something else that is unavailable.
+    if [[ "$want" != "protun-tls" ]] && protocol_available "protun-tls"; then
+        warn "Protocol ${want} unavailable — using Stealth (protun-tls)."
+        set_protocol "protun-tls"
+        printf '%s\n' "protun-tls"
+        return 0
+    fi
+    if [[ "$want" == protun-* ]]; then
+        warn "Protocol ${want} is not available on this install."
+        note "Stealth needs:  proton-vpn-linux  +  python3-proton-vpn-lib"
+        note "Install via Tor (Proton repo is often blocked):"
+        note "  sudo apt-get -o Acquire::https::Proxy::repo.protonvpn.com=socks5h://127.0.0.1:9050 install python3-proton-vpn-lib"
+        note "  # NM plugin is currently in Proton unstable:"
+        note "  #   https://repo.protonvpn.com/debian/.../proton-vpn-linux_*.deb"
+        note "Falling back to ${fallback} (less likely to survive filtering)."
+    else
+        warn "Protocol ${want} is not available — trying ${fallback}."
+    fi
+    if protocol_available "$fallback"; then
+        set_protocol "$fallback"
+        printf '%s\n' "$fallback"
+        return 0
+    fi
+    err "No usable VPN protocol backend found (not a login problem)."
+    note "You are signed in. Fix packages, then:  pvpn protocols"
+    return 1
+}
+
+cmd_protocols() {
+    /usr/bin/python3 - <<'PY'
+import importlib
+from proton.vpn.core.registry import Registry
+r = Registry()
+for mod in (
+    "proton.vpn.backend.networkmanager.protocol.openvpn",
+    "proton.vpn.backend.networkmanager.protocol.wireguard",
+    "proton.vpn.backend.networkmanager.protocol.protun",
+):
+    try:
+        importlib.import_module(mod).register(r)
+    except Exception as e:
+        print(f"  (failed to load {mod}: {e})")
+print("Protocol backends on this machine:")
+for key in sorted(r._registry):
+    cls = r._registry[key]
+    ok = cls.validate()
+    mark = "OK  " if ok else "MISS"
+    print(f"  [{mark}] {key}")
+print()
+print("MISS on protun-* means Stealth is missing. Install:")
+print("  python3-proton-vpn-lib   (Proton stable)")
+print("  proton-vpn-linux         (NM protun plugin — Proton unstable today)")
+print("On filtered wifi, fetch via Tor, e.g.:")
+print("  sudo apt-get -o Acquire::https::Proxy::repo.protonvpn.com=socks5h://127.0.0.1:9050 install python3-proton-vpn-lib")
+PY
 }
 
 # Every curl here uses --noproxy '*'. If your shell exports HTTPS_PROXY or
@@ -283,22 +384,49 @@ SERVERLIST="$HOME/.cache/Proton/VPN/serverlist.json"
 STALE_HOURS="${PVPN_STALE_HOURS:-24}"
 
 ensure_fresh_data() {
-    local age_h=99999
+    # Only the ABSENCE of a cache is worth blocking a connect for.
+    #
+    # Refreshing over Tor means dragging ~2.5 MB down a Tor circuit, which
+    # measured at several minutes. Doing that merely because the list is a
+    # day old is a bad trade: Proton's client connects perfectly well with
+    # a stale list, and refresh_after_connect() below then updates it in
+    # seconds through the tunnel, where the API is reachable directly.
     if [[ -s $SERVERLIST ]]; then
-        age_h=$(( ( $(date +%s) - $(stat -c %Y "$SERVERLIST") ) / 3600 ))
-    fi
-    if (( age_h < STALE_HOURS )); then
-        say "Server list is ${age_h}h old - no refresh needed."
+        local age_h=$(( ( $(date +%s) - $(stat -c %Y "$SERVERLIST") ) / 3600 ))
+        say "Server list is ${age_h}h old - connecting now, refresh comes after."
         return 0
     fi
 
     need_tor
-    warn "Server list is stale. Refreshing over Tor first (routing untouched,"
-    warn "so your internet keeps working). This can take a few minutes once."
+    warn "No server list cached yet. Fetching it over Tor - this is a one-off,"
+    warn "and routing is untouched, so your internet keeps working."
     if timeout "$REFRESH_TIMEOUT" "${PV_TOR[@]}" servers >/dev/null 2>&1 && [[ -s $SERVERLIST ]]; then
         ok "Server list cached ($(( $(stat -c %s "$SERVERLIST") / 1024 )) KB)."
     else
-        warn "Refresh failed or timed out. Trying to connect with what we have."
+        warn "Could not fetch it. Trying to connect anyway."
+    fi
+}
+
+# Once the tunnel is up, Proton's API is reachable directly - verified:
+# vpn-api.proton.me returns HTTP 200 through the tunnel while returning
+# nothing at all beside it. That makes this the cheapest possible moment to
+# refresh, and it removes Tor from the connect path entirely.
+#
+# Best-effort on purpose: `protonvpn servers` does NOT force a refresh (it
+# reads cache and returns in ~1s), so we nudge the client and re-check the
+# mtime rather than claiming success we cannot verify.
+refresh_after_connect() {
+    [[ -s $SERVERLIST ]] || return 0
+    local age_h before
+    age_h=$(( ( $(date +%s) - $(stat -c %Y "$SERVERLIST") ) / 3600 ))
+    (( age_h < STALE_HOURS )) && return 0
+
+    before=$(stat -c %Y "$SERVERLIST")
+    timeout 90 "${PV_DIRECT[@]}" servers >/dev/null 2>&1 || true
+    if [[ $(stat -c %Y "$SERVERLIST") -gt $before ]]; then
+        ok "Server list refreshed through the tunnel."
+    else
+        say "(server list still ${age_h}h old; the client refreshes on its own schedule)"
     fi
 }
 
@@ -430,6 +558,7 @@ cmd_hop() {
         trap cleanup_log EXIT INT TERM
         ok "Hopped${before:+: ${before%% in *} ->} ${after}"
         cmd_ip
+        refresh_after_connect
         return 0
     fi
 
@@ -460,7 +589,7 @@ cmd_scan() {
 # Scan, then hop to the fastest.
 cmd_best() {
     [[ -f "$SCAN" ]] || { err "scanner missing at $SCAN - re-run setup.sh"; return 1; }
-    local was_connected=0 winner
+    local was_connected=0
     if is_connected; then
         was_connected=1
         say "Disconnecting so probes measure this network, not the tunnel..."
@@ -468,14 +597,42 @@ cmd_best() {
     fi
 
     say "Probing servers${1:+ matching '$1'}..."
-    winner="$(/usr/bin/python3 "$SCAN" "${1:-}" --quiet 2>/dev/null)"
-    if [[ -z "$winner" ]]; then
+    # Take the whole ranked list, not just the winner. Staking everything on
+    # the single fastest server means one transient failure ends the command
+    # - which is exactly what happened with JP-FREE#4, a server that
+    # connects fine when tried again.
+    local ranked
+    ranked="$(/usr/bin/python3 "$SCAN" "${1:-}" --json 2>/dev/null \
+        | /usr/bin/python3 -c 'import json,sys
+try:
+    for r in json.load(sys.stdin):
+        print(r["name"])
+except Exception:
+    pass')"
+
+    if [[ -z "$ranked" ]]; then
         err "Scan found nothing reachable."
         (( was_connected )) && cmd_up
         return 1
     fi
-    ok "Fastest: ${winner}"
-    cmd_hop "$winner"
+
+    local n=0 max="${PVPN_BEST_TRIES:-4}"
+    while read -r srv; do
+        [[ -n "$srv" ]] || continue
+        (( n++ )); (( n > max )) && break
+        if (( n == 1 )); then
+            ok "Fastest: ${srv}"
+        else
+            warn "Falling back to #${n} by latency: ${srv}"
+        fi
+        if cmd_hop "$srv"; then
+            return 0
+        fi
+    done <<< "$ranked"
+
+    err "None of the top ${max} servers would connect."
+    (( was_connected )) && cmd_up
+    return 1
 }
 
 cmd_up() {
@@ -491,8 +648,14 @@ cmd_up() {
         ok "Already connected."; cmd_status; return 0
     fi
 
-    [[ -n "$proto" ]] && set_protocol "$proto"
+    # Primary default is Stealth. Explicit args still win when available.
+    if [[ -n "$proto" ]]; then
+        set_protocol "$proto"
+    elif protocol_available "protun-tls"; then
+        set_protocol "protun-tls"
+    fi
     proto="$(current_protocol)"
+    proto="$(ensure_connect_protocol "$proto")" || return 1
 
     # Do the slow API work FIRST, while routing is still untouched. If the
     # server list is stale, connect would try to refresh it mid-connect with
@@ -553,6 +716,7 @@ cmd_up() {
                 trap cleanup_log EXIT INT TERM
                 ok "Connected via ${proto}."
                 cmd_ip
+                refresh_after_connect
                 return 0
             fi
             # Do NOT tear this down. Every tunnel we ever declared dead was
@@ -566,10 +730,26 @@ cmd_up() {
         return 0
         else
             err "Could not connect via ${proto} (timed out or refused)."
-            grep -iE 'error|failed|not available|free plan' "$LOG" | tail -2
+            grep -iE 'error|failed|not available|free plan|No valid implementation|unexpected' "$LOG" | tail -5
+            # Missing protocol backend — do not burn retries.
+            if grep -qiE 'No valid implementation found' "$LOG"; then
+                err "Backend missing for ${proto}. Run:  pvpn protocols"
+                break
+            fi
             # A hard refusal (free-plan limit, bad protocol) will not fix
             # itself on retry, so stop rather than burn three attempts.
             grep -qiE 'not available on the free plan|Missing username' "$LOG" && break
+            # TCP/443 opens but OpenVPN's TLS never finishes. Measured
+            # cause on detnsw was per-destination filtering, not packet
+            # inspection: 69/70 Proton servers complete a normal TLS
+            # handshake there.
+            if [[ "$proto" == openvpn-* ]] && journalctl -u NetworkManager --since "2 min ago" --no-pager 2>/dev/null \
+                    | grep -q 'TLS Error: TLS handshake failed'; then
+                warn "OpenVPN reached the server, but its TLS never completed."
+                note "Stealth (protun-tls) is required on this network — OpenVPN will not work."
+                note "Check:  pvpn protocols   (protun-* must be OK, not MISS)"
+                break
+            fi
         fi
     done
     trap cleanup_log EXIT INT TERM
@@ -597,22 +777,176 @@ cmd_ip() {
     say "Public IP: ${ip:-<unavailable>}"
 }
 
+# Browser → CLI session bridge (Proton fork SSO). Local helper + paste link;
+# import runs under Tor when the API is blocked.
+cmd_login_bridge() {
+    need_shim
+    local email="${1:-}" api_timeout="${PVPN_LOGIN_API_TIMEOUT:-60}"
+    local bridge="$SHIM/signin-bridge.py" selector="" rc=0
+    local -a helper_env import_env
+
+    if [[ ! -f "$bridge" ]]; then
+        err "Missing $bridge — re-run ./setup.sh"
+        return 1
+    fi
+
+    say "Starting browser sign-in bridge..."
+    note "1) Sign in / CAPTCHA in the browser (use a hotspot if Proton is blocked here)"
+    note "2) Paste the redirected URL (contains selector=) into the helper page"
+    note "3) This imports that session into the Proton CLI keyring"
+
+    helper_env=(env "PYTHONPATH=$SHIM" PVPN_DEBUG=0 "PVPN_API_TIMEOUT=$api_timeout")
+    # Helper must NOT use torsocks — it opens the real default browser.
+    # Capture stdout (selector); bridge progress goes to the tty.
+    if [[ -n "$email" ]]; then
+        selector=$("${helper_env[@]}" /usr/bin/python3 "$bridge" --helper --email "$email" 2>/dev/tty) || rc=$?
+    else
+        selector=$("${helper_env[@]}" /usr/bin/python3 "$bridge" --helper 2>/dev/tty) || rc=$?
+    fi
+    # Last line is the selector; strip noise if any.
+    selector=$(printf '%s\n' "$selector" | tail -n1 | tr -d '\r')
+    if [[ $rc -ne 0 || -z "$selector" ]]; then
+        err "Bridge did not receive a sign-in link."
+        return 1
+    fi
+
+    say "Importing forked session into Proton CLI..."
+    if api_reachable; then
+        import_env=(env "PYTHONPATH=$SHIM" PVPN_DEBUG=0 "PVPN_API_TIMEOUT=$api_timeout")
+    else
+        need_tor
+        import_env=(torsocks env "PYTHONPATH=$SHIM" PVPN_DEBUG=0
+                    "PVPN_API_TIMEOUT=$api_timeout")
+    fi
+    "${import_env[@]}" /usr/bin/python3 "$bridge" --import-selector "$selector" || return 1
+    ok "Browser bridge complete."
+    cmd_account_view || true
+}
+
 cmd_login() {
-    need_tor; need_shim
-    local user="${1:-}"
+    need_shim
+    local user="" rc=0 browser_bridge=0
+    # pvpn login --browser  → fork-SSO bridge (link → CLI session)
+    # pvpn login [email]
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --browser|-b)
+                browser_bridge=1; shift ;;
+            -h|--help)
+                cat <<'EOF'
+pvpn login — sign in to Proton
+
+  pvpn login [email]     CLI password sign-in (Tor if API blocked)
+  pvpn login --browser   browser bridge: CAPTCHA in browser, session → CLI
+EOF
+                return 0
+                ;;
+            *)
+                user="$1"; shift ;;
+        esac
+    done
+
+    if (( browser_bridge )); then
+        cmd_login_bridge "$user"
+        return $?
+    fi
+
     if [[ -z "$user" ]]; then
         read -r -p "Proton account email (e.g. you@proton.me): " user
     fi
-    # debug-signin.py masks the password with dots as you type.
-    if [[ -f "$SHIM/debug-signin.py" ]]; then
-        torsocks env PYTHONPATH="$SHIM" PVPN_DEBUG=0 \
-            /usr/bin/python3 "$SHIM/debug-signin.py" signin "$user"
+
+    # Prefer a direct login when the API is reachable — avoids Tor exits
+    # that trigger Proton's CAPTCHA (CLI cannot solve CAPTCHAs).
+    # On filtered nets, fall back to Tor with a long API timeout.
+    # sitecustomize defaults PVPN_API_TIMEOUT=2 for connect fail-fast;
+    # that value is fatal for login over Tor.
+    local api_timeout="${PVPN_LOGIN_API_TIMEOUT:-60}"
+    local -a run
+    if api_reachable; then
+        say "Proton API reachable — signing in directly (no Tor)."
+        run=(env "PYTHONPATH=$SHIM" PVPN_DEBUG=0
+             "PVPN_API_TIMEOUT=$api_timeout")
     else
-        pv_tor signin "$user"
+        need_tor
+        warn "API blocked here — signing in via Tor (timeout ${api_timeout}s)."
+        warn "If Proton asks for a CAPTCHA, use:  pvpn login --browser"
+        run=(torsocks env "PYTHONPATH=$SHIM" PVPN_DEBUG=0
+             "PVPN_API_TIMEOUT=$api_timeout")
+    fi
+
+    if [[ -f "$SHIM/debug-signin.py" ]]; then
+        "${run[@]}" /usr/bin/python3 "$SHIM/debug-signin.py" signin "$user" || rc=$?
+    else
+        "${run[@]}" protonvpn signin "$user" || rc=$?
+    fi
+
+    # Exit 2 from debug-signin.py = CAPTCHA / human-check required.
+    if [[ $rc -eq 2 ]]; then
+        warn "CAPTCHA required — switching to browser sign-in bridge."
+        cmd_login_bridge "$user"
+        return $?
+    fi
+    return "$rc"
+}
+
+cmd_logout() {
+    need_shim
+    # Sign-out talks to Proton's API when possible; use Tor on filtered nets.
+    if api_reachable; then
+        pv signout
+    else
+        need_tor
+        local api_timeout="${PVPN_LOGIN_API_TIMEOUT:-60}"
+        torsocks env PYTHONPATH="$SHIM" PVPN_DEBUG=0 \
+            "PVPN_API_TIMEOUT=$api_timeout" \
+            protonvpn signout
     fi
 }
 
-cmd_logout() { pv_tor signout; }
+cmd_account_view() {
+    local info acct
+    info="$(pv info 2>/dev/null || true)"
+    acct="$(printf '%s\n' "$info" | awk -F"'" '/^Account:/{print $2; exit}')"
+    if [[ -z "$acct" || "$acct" == "None" ]]; then
+        warn "Not signed in."
+        say "  Sign in with:  pvpn login"
+        return 1
+    fi
+    say "$info"
+    say "Protocol: $(current_protocol)"
+    if is_connected; then
+        ok "VPN: connected"
+        cmd_ip
+    else
+        say "VPN: disconnected"
+    fi
+}
+
+cmd_account() {
+    local action="${1:-}"
+    case "$action" in
+        ""|--view|-v|view)
+            cmd_account_view
+            ;;
+        --logout|-l|logout|signout)
+            cmd_logout
+            ;;
+        -h|--help|help)
+            cat <<'EOF'
+pvpn account — Proton account
+
+  pvpn account              show account (same as --view)
+  pvpn account --view       show signed-in account + VPN state
+  pvpn account --logout     sign out and clear local credentials
+EOF
+            ;;
+        *)
+            err "Unknown account option: $action"
+            say "Usage: pvpn account [--view|--logout]"
+            return 1
+            ;;
+    esac
+}
 
 cmd_try() {
     need_tor; need_shim
@@ -644,12 +978,21 @@ pvpn - simple Proton VPN control
   pvpn status          show connection state and protocol
   pvpn ip              show your current public IP
   pvpn login [email]   sign in to your Proton account
-  pvpn logout          sign out
+  pvpn login --browser browser bridge (CAPTCHA in browser → CLI session)
+  pvpn account         account helpers (see below)
+  pvpn logout          sign out (same as: pvpn account --logout)
   pvpn try             try every protocol, stop at the first that works
+  pvpn protocols       which backends are actually available here
   pvpn help            this message
 
-Protocols: protun-tls (Stealth), protun-udp, protun-tcp, protun-smart,
-           openvpn-tcp, openvpn-udp, wireguard
+Account:
+  pvpn account --view     show signed-in account + VPN state
+  pvpn account --logout   sign out and clear local credentials
+
+Default protocol: protun-tls, which the Proton client labels Stealth.
+They are the same thing, not two options.
+Others: protun-udp, protun-tcp, protun-smart, openvpn-tcp, openvpn-udp, wireguard
+  Stealth packages: python3-proton-vpn-lib + proton-vpn-linux (NM protun)
 
 `hop` works around the free plan having no server selection (--country,
 --random and by-ID are all refused, and reconnecting returned the SAME
@@ -662,7 +1005,7 @@ always, including on Ctrl-C.
   pvpn hop SG-FREE#12 that exact one
 
 Notes:
-  Connecting stalls your internet for ~10s (PVPN_TIMEOUT to change).
+  Connecting stalls your internet briefly (PVPN_TIMEOUT to change).
   If it fails, times out, or you press Ctrl-C, your connection is restored
   automatically. If anything ever seems stuck, run:  pvpn down
 EOF
@@ -676,9 +1019,11 @@ case "${1:-help}" in
     down|disconnect) cmd_down ;;
     status|st)       cmd_status ;;
     ip)              cmd_ip ;;
-    login|signin)    shift; cmd_login "${1:-}" ;;
+    login|signin)    shift; cmd_login "$@" ;;
+    account|acct)    shift; cmd_account "${1:-}" ;;
     logout|signout)  cmd_logout ;;
     try)             cmd_try ;;
+    protocols|protos) cmd_protocols ;;
     help|-h|--help)  usage ;;
     *)               err "Unknown command: $1"; say ""; usage; exit 1 ;;
 esac
