@@ -424,6 +424,43 @@ cmd_hop() {
     return 0
 }
 
+# Rank servers by measured latency, in parallel.
+#
+# Connecting cannot be parallelised - one routing table, one VPN slot - but
+# PROBING can. lib/pvpn-scan.py opens concurrent TLS handshakes to every
+# candidate and times them, then we make a single connect to the winner.
+SCAN="$SHIM/pvpn-scan.py"
+
+cmd_scan() {
+    [[ -f "$SCAN" ]] || { err "scanner missing at $SCAN - re-run setup.sh"; return 1; }
+    if is_connected; then
+        warn "You are connected - probes would measure your exit node, not"
+        warn "this network. Run 'pvpn down' first for meaningful numbers."
+    fi
+    /usr/bin/python3 "$SCAN" "${1:-}" ${PVPN_SCAN_ARGS:-}
+}
+
+# Scan, then hop to the fastest.
+cmd_best() {
+    [[ -f "$SCAN" ]] || { err "scanner missing at $SCAN - re-run setup.sh"; return 1; }
+    local was_connected=0 winner
+    if is_connected; then
+        was_connected=1
+        say "Disconnecting so probes measure this network, not the tunnel..."
+        pv disconnect >/dev/null 2>&1; sleep 2
+    fi
+
+    say "Probing servers${1:+ matching '$1'}..."
+    winner="$(/usr/bin/python3 "$SCAN" "${1:-}" --quiet 2>/dev/null)"
+    if [[ -z "$winner" ]]; then
+        err "Scan found nothing reachable."
+        (( was_connected )) && cmd_up
+        return 1
+    fi
+    ok "Fastest: ${winner}"
+    cmd_hop "$winner"
+}
+
 cmd_up() {
     local proto="${1:-}"
     # Deliberately NOT need_tor here. Connecting goes straight to Proton's
@@ -584,6 +621,8 @@ pvpn - simple Proton VPN control
 
   pvpn up [protocol]   connect (optionally forcing a protocol)
   pvpn hop [match]     switch server; optionally one matching e.g. JP, SG-FREE#12
+  pvpn scan [match]    rank servers by measured latency (probes in parallel)
+  pvpn best [match]    scan, then connect to the fastest
   pvpn down            disconnect and restore normal internet
   pvpn status          show connection state and protocol
   pvpn ip              show your current public IP
@@ -615,6 +654,8 @@ EOF
 case "${1:-help}" in
     up|connect)      shift; cmd_up "${1:-}" ;;
     hop|next)        shift; cmd_hop "${1:-}" ;;
+    scan)            shift; cmd_scan "${1:-}" ;;
+    best|fastest)    shift; cmd_best "${1:-}" ;;
     down|disconnect) cmd_down ;;
     status|st)       cmd_status ;;
     ip)              cmd_ip ;;

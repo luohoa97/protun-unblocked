@@ -84,13 +84,46 @@ before you spend time on the client.
   with a shim that forces aiohttp onto its threaded resolver — torsocks cannot
   proxy the UDP that `aiodns` uses, so lookups fail without it.
 
+## Picking a fast server
+
+```bash
+pvpn scan          # rank every free server by measured latency
+pvpn scan JP       # only Japanese ones
+pvpn best          # scan, then connect to the fastest
+pvpn best SG       # fastest Singapore server
+```
+
+**Probing is parallel; connecting cannot be.** A connect rewrites the default
+route, DNS and the kill-switch device, and there is one routing table per
+machine — two connects would corrupt each other. So `scan` opens concurrent
+TLS handshakes to every candidate and times them, then `best` makes a single
+connect to the winner. **80 servers in 10 seconds.**
+
+It times the **TLS handshake**, not TCP connect, and that distinction matters
+on a filtered network. Measured from Australia:
+
+| server | TCP connect | TLS handshake |
+|---|---|---|
+| JP-FREE#1 (Tokyo) | 2.3ms | 454ms |
+| US-FREE#50 | 1.6ms | 756ms |
+| NL-FREE#1 (Netherlands) | 2.0ms | 1464ms |
+
+TCP claims 1.6ms to the United States — impossible; the middlebox answers the
+handshake locally. A TLS handshake has to reach the real server, so it can't be
+faked, and it orders correctly by distance.
+
+Latency shown is ~2–3 round trips plus the server's crypto work — **comparable
+between servers, not an absolute ping**. Server load inflates it, which is
+desirable: a loaded server is a bad pick regardless of distance.
+
 ## Tuning
 
 | variable | default | meaning |
 |---|---|---|
 | `PVPN_TIMEOUT` | 30 | seconds to wait for a tunnel |
 | `PVPN_SETTLE` | 90 | grace period for traffic to start (exits as soon as traffic flows) |
-| `PVPN_ATTEMPTS` | 3 | connect attempts (new server each time) |
+| `PVPN_ATTEMPTS` | 3 | connect attempts |
+| `PVPN_SCAN_ARGS` | — | extra args for `scan`, e.g. `--samples 3 --limit 200` |
 | `PVPN_API_TIMEOUT` | 2 | Proton API transport timeout |
 | `PVPN_FAST` | 0 | blackhole the API in `/etc/hosts` for the connect (needs sudo) |
 

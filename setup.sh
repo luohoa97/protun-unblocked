@@ -94,6 +94,7 @@ install -m755 "$SRC/bin/vpn-check" "$BIN/vpn-check"; ok "$BIN/vpn-check"
 install -m644 "$SRC/lib/sitecustomize.py" "$LIB/";   ok "$LIB/sitecustomize.py"
 install -m644 "$SRC/lib/aiodns.py"        "$LIB/";   ok "$LIB/aiodns.py"
 [[ -f "$SRC/lib/debug-signin.py" ]] && install -m755 "$SRC/lib/debug-signin.py" "$LIB/" && ok "$LIB/debug-signin.py"
+install -m755 "$SRC/lib/pvpn-scan.py"   "$LIB/";   ok "$LIB/pvpn-scan.py"
 
 # pvpn defaults its shim dir to ~/.local/share/protonvpn-torshim for backward
 # compatibility; point it at the installed location instead.
