@@ -689,7 +689,7 @@ except Exception: pass' "$cache"
         fi
     fi
 
-    say "Ranking servers${filter:+ matching '''$filter'''} by latency and load..." >&2
+    say "Ranking servers${filter:+ matching \"$filter\"} by latency and load..." >&2
     if ! /usr/bin/python3 "$SCAN" ${filter:+"$filter"} --json > "$cache" 2>/dev/null \
        || [[ ! -s "$cache" ]]; then
         rm -f "$cache"
