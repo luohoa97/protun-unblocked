@@ -57,3 +57,21 @@ pvpn-gui-install:
     install -Dm644 data/dev.pvpn.Gui.desktop \
         "$HOME/.local/share/applications/dev.pvpn.Gui.desktop"
     echo "Installed to ~/.local/bin/pvpn-gui"
+
+# Install the resume hook, so the VPN repairs itself after suspend
+[group('Network')]
+pvpn-resume-hook:
+    #!/usr/bin/bash
+    set -euo pipefail
+    # On resume protun's transport dies and it retries with a WireGuard UDP
+    # handshake probe. Where UDP is blocked - the reason for Stealth - that
+    # probe never succeeds, so it never recovers, while NetworkManager still
+    # shows proton0 activated and the CLI still says Connected.
+    SRC=/usr/share/pvpn/pvpn-resume
+    if [ ! -f "$SRC" ]; then
+        echo "Not found: $SRC (is pvpn installed from the image?)"
+        exit 1
+    fi
+    sudo install -Dm755 "$SRC" /etc/systemd/system-sleep/pvpn-resume
+    echo "Installed /etc/systemd/system-sleep/pvpn-resume"
+    echo "It logs to /var/log/pvpn-resume.log; test with a real suspend."

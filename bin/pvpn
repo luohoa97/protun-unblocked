@@ -161,7 +161,25 @@ current_server() {
 }
 
 # NB: must not match "Disconnected", which contains "connected".
+# This is only what Proton's client BELIEVES - see tunnel_alive().
 is_connected() { pv status 2>/dev/null | grep -qE 'Status:[[:space:]]*Connected'; }
+
+# Is the tunnel actually carrying traffic?
+#
+# After a suspend/resume the client keeps reporting Connected and NM leaves
+# proton0 "activated" while the transport underneath is dead. Observed in
+# the NetworkManager journal on resume:
+#
+#   Received TransportAlert(Shutdown(StreamId(1)))
+#   Shutdown(StreamId(1)): reconnecting
+#   WireguardUdp/handshake probe failed
+#   already disconnected
+#
+# protun tries to re-establish with a WireGuard *UDP* handshake probe. On a
+# network that blocks UDP - the reason we are on Stealth at all - that probe
+# can never succeed, so it never self-heals. Trusting the client's own
+# status here would report a working VPN that passes nothing.
+tunnel_alive() { is_connected && net_works; }
 
 current_protocol() {
     [[ -f "$SETTINGS" ]] || { echo "unknown"; return; }
@@ -738,7 +756,16 @@ cmd_up() {
     need_shim
 
     if is_connected; then
-        ok "Already connected."; cmd_status; return 0
+        if net_works; then
+            ok "Already connected."; cmd_status; return 0
+        fi
+        # Claims connected but nothing passes - the post-resume case. Tear
+        # it down and rebuild rather than reporting a working VPN.
+        warn "Connected, but no traffic is passing - stale tunnel."
+        note "common after suspend: protun's reconnect probes UDP, which this"
+        note "network blocks, so it cannot recover on its own. Rebuilding..."
+        restore >/dev/null 2>&1
+        sleep 2
     fi
 
     # Primary default is Stealth. Explicit args still win when available.
@@ -893,6 +920,22 @@ cmd_status() {
     local s; s="$(pv status 2>/dev/null | head -3)"
     say "${s:-Status: unknown}"
     say "Protocol: $(current_protocol)"
+
+    # Report what is TRUE, not what the client believes. It keeps saying
+    # Connected after a suspend while the transport underneath is dead, and
+    # a status command that agrees with it is worse than useless - you act
+    # on it.
+    if is_connected; then
+        if net_works; then
+            ok "Traffic: passing"
+        else
+            err "Traffic: NONE - the tunnel is up but dead."
+            note "Usual cause is suspend/resume: protun tries to re-establish"
+            note "with a WireGuard UDP probe, which this network blocks, so it"
+            note "cannot recover by itself."
+            note "Fix:  pvpn up      (detects this and rebuilds)"
+        fi
+    fi
 }
 
 cmd_ip() {

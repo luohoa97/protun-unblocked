@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+#
+# Copyright (C) 2026 Neil Luo
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# systemd sleep hook: repair the VPN after resume.
+#
+# Install to /usr/lib/systemd/system-sleep/pvpn-resume (image) or
+# /etc/systemd/system-sleep/pvpn-resume (manual, needs sudo). systemd runs
+# these as root with $1 = pre|post and $2 = suspend|hibernate|...
+#
+# WHY THIS IS NEEDED
+#
+# On resume, protun's transport is dead but nothing notices. From the
+# NetworkManager journal:
+#
+#   Received TransportAlert(Shutdown(StreamId(1)))
+#   Shutdown(StreamId(1)): reconnecting
+#   WireguardUdp/handshake probe failed
+#   already disconnected
+#
+# It DOES try to reconnect - by probing with a WireGuard UDP handshake. On a
+# network that blocks UDP (the reason for using Stealth in the first place)
+# that probe can never succeed, so it retries forever and never recovers.
+# Meanwhile NetworkManager keeps proton0 "activated" and the CLI keeps
+# reporting Connected, so nothing else notices either.
+#
+# So: wait for the network, check whether traffic actually passes, and if
+# not, rebuild the tunnel as the user who owns the session.
+set -uo pipefail
+
+[ "${1:-}" = "post" ] || exit 0
+
+LOG=/var/log/pvpn-resume.log
+log() { printf '%s %s\n' "$(date -Is)" "$*" >> "$LOG" 2>/dev/null || true; }
+
+# Who owns the graphical session? The Proton client keeps per-user state
+# (keyring, settings.json), so this has to run as them, not as root.
+USER_NAME="$(loginctl list-sessions --no-legend 2>/dev/null \
+    | awk '$3 != "" {print $3; exit}')"
+[ -n "$USER_NAME" ] || USER_NAME="$(stat -c %U /run/user/1000 2>/dev/null)"
+[ -n "$USER_NAME" ] || { log "no session user; giving up"; exit 0; }
+
+USER_ID="$(id -u "$USER_NAME" 2>/dev/null)" || exit 0
+PVPN="$(command -v pvpn 2>/dev/null || echo /usr/bin/pvpn)"
+[ -x "$PVPN" ] || { log "pvpn not found"; exit 0; }
+
+as_user() {
+    systemd-run --quiet --pipe --wait \
+        --machine="${USER_NAME}@" --user \
+        --setenv=PATH="/usr/bin:/usr/local/bin:/home/${USER_NAME}/.local/bin" \
+        "$@" 2>/dev/null
+}
+
+# Wi-Fi takes a few seconds to come back; probing before then would always
+# say "no traffic" and trigger a pointless reconnect.
+for _ in $(seq 1 20); do
+    ip -4 route show default 2>/dev/null | grep -q . && break
+    sleep 1
+done
+sleep 3
+
+# Does the client think it is connected?
+if ! as_user "$PVPN" status 2>/dev/null | grep -qE 'Status:[[:space:]]*Connected'; then
+    log "not connected before suspend; nothing to repair"
+    exit 0
+fi
+
+# Is that true? Probe as the user, bypassing any proxy, IPv4 only - the
+# same probes pvpn itself uses.
+if as_user curl -s --noproxy '*' -4 --max-time 6 -o /dev/null \
+        http://connectivitycheck.gstatic.com/generate_204; then
+    log "tunnel survived resume; leaving it alone"
+    exit 0
+fi
+
+log "tunnel is up but passing no traffic after resume - rebuilding"
+as_user "$PVPN" up >/dev/null 2>&1
+if as_user curl -s --noproxy '*' -4 --max-time 8 -o /dev/null \
+        http://connectivitycheck.gstatic.com/generate_204; then
+    log "reconnected successfully"
+else
+    log "reconnect did not restore traffic; left for the user to handle"
+fi
+exit 0
