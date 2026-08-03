@@ -335,16 +335,32 @@ restore_cache() {
 
 # steer_cache <mode> <pattern>
 #   exclude <name>    - hide exactly this server
-#   only    <pattern> - hide every free server NOT matching (case-insensitive)
+#   only    <pattern> - hide every free server the filter does not select
+#
+# The "only" filter is resolved by lib/pvpn-scan.py --names, so `hop` and
+# `scan` share one matcher and one alias table. That is why `hop japan`,
+# `hop tokyo` and `hop JP,SG` all work the same way `scan` does.
 steer_cache() {
-    local mode="$1" pat="$2"
+    local mode="$1" pat="$2" allow=""
     [[ -s "$SERVERLIST" ]] || { err "No cached server list. Run: pvpn up"; return 1; }
+
+    if [[ "$mode" == only ]]; then
+        allow="$(/usr/bin/python3 "$SCAN" "$pat" --names 2>/dev/null)"
+        if [[ -z "$allow" ]]; then
+            err "No free server matches '${pat}'."
+            say "  try: pvpn scan   (to see what exists)"
+            return 1
+        fi
+    fi
+
     CACHE_BAK="${SERVERLIST}.pvpn-bak"
     cp -f "$SERVERLIST" "$CACHE_BAK" || { CACHE_BAK=""; return 1; }
 
-    MODE="$mode" PAT="$pat" SL="$SERVERLIST" /usr/bin/python3 - <<'PYEOF'
+    MODE="$mode" PAT="$pat" ALLOW="$allow" SL="$SERVERLIST" /usr/bin/python3 - <<'PYIN'
 import json, os, sys, pathlib
-mode, pat = os.environ["MODE"], os.environ["PAT"].upper()
+mode = os.environ["MODE"]
+pat = os.environ["PAT"].upper()
+allow = {n.strip().upper() for n in os.environ.get("ALLOW", "").splitlines() if n.strip()}
 p = pathlib.Path(os.environ["SL"])
 d = json.loads(p.read_text())
 key = "LogicalServers" if "LogicalServers" in d else "Servers"
@@ -352,27 +368,28 @@ kept = hidden = 0
 for srv in d[key]:
     name = (srv.get("Name") or "").upper()
     if "FREE" not in name:
-        continue                      # paid servers are unreachable to us anyway
-    match = pat in name
-    hide = match if mode == "exclude" else not match
+        continue                  # paid servers are unreachable to us anyway
+    hide = (pat in name) if mode == "exclude" else (name not in allow)
     if hide:
         srv["Status"] = 0
         hidden += 1
     else:
         kept += 1
 if kept == 0:
-    sys.stderr.write("no free server matches that pattern\n")
+    sys.stderr.write("filter left no candidates\n")
     sys.exit(2)
 p.write_text(json.dumps(d))
 print(f"{kept} candidate server(s), {hidden} hidden")
-PYEOF
+PYIN
 }
 
 # Move to a different server, optionally a specific one.
 #
-#   pvpn hop            any server other than the current one
-#   pvpn hop JP         any Japanese free server
-#   pvpn hop SG-FREE#12 that exact server
+#   pvpn hop             any server other than the current one
+#   pvpn hop japan       by country name
+#   pvpn hop tokyo       by city
+#   pvpn hop JP,SG       several, OR-ed
+#   pvpn hop SG-FREE#12  one exact server
 cmd_hop() {
     need_shim
     local want="${1:-}" before after rc

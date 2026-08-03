@@ -40,6 +40,28 @@ naive checks measure the proxy rather than the tunnel — and a proxy's circuits
 break the instant the tunnel takes over routing, so a working VPN looks dead.
 Every check here uses `curl --noproxy '*'`.
 
+## GUI
+
+A libadwaita front-end, in Rust:
+
+```bash
+./setup.sh --gui
+```
+
+It is a thin shell over the CLI, not a reimplementation — connect, hop,
+scan-and-pick-a-server, live status. All the awkward behaviour (restoring
+routing on failure, waiting out slow tunnels, steering server choice) stays in
+one place, so both front-ends inherit it and neither can drift from the other.
+
+Commands run on worker threads and report back over an async channel: a connect
+can take tens of seconds, and the window must not freeze meanwhile. Controls
+disable while one is in flight, because a second connect would fight over the
+same routing table.
+
+Optional and skipped by default — it needs `cargo`, `gtk4-devel` and
+`libadwaita-devel`, and the first build compiles the gtk4/libadwaita crates
+(~1 minute). The CLI is fully functional without it.
+
 ## Install
 
 ```bash

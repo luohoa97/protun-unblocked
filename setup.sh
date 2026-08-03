@@ -96,6 +96,30 @@ install -m644 "$SRC/lib/aiodns.py"        "$LIB/";   ok "$LIB/aiodns.py"
 [[ -f "$SRC/lib/debug-signin.py" ]] && install -m755 "$SRC/lib/debug-signin.py" "$LIB/" && ok "$LIB/debug-signin.py"
 install -m755 "$SRC/lib/pvpn-scan.py"   "$LIB/";   ok "$LIB/pvpn-scan.py"
 
+# --- optional libadwaita GUI ------------------------------------------
+# Skipped unless you ask for it: it needs a Rust toolchain and pulls the
+# gtk4/libadwaita crates, which is a few minutes of compiling. The CLI is
+# fully functional without it.
+if [[ "${1:-}" == "--gui" ]]; then
+    if ! command -v cargo >/dev/null; then
+        note "--gui needs a Rust toolchain (cargo). Skipping the GUI."
+    elif ! pkg-config --exists gtk4 libadwaita-1 2>/dev/null; then
+        note "--gui needs gtk4-devel and libadwaita-devel. Skipping the GUI."
+    else
+        head_ "Building the GUI (first build takes a few minutes)..."
+        if (cd "$SRC/gui" && cargo build --release --quiet); then
+            install -m755 "$SRC/gui/target/release/pvpn-gui" "$BIN/"
+            ok "$BIN/pvpn-gui"
+            install -d "$HOME/.local/share/applications"
+            install -m644 "$SRC/gui/data/dev.pvpn.Gui.desktop" \
+                "$HOME/.local/share/applications/"
+            ok "$HOME/.local/share/applications/dev.pvpn.Gui.desktop"
+        else
+            note "GUI build failed - the CLI is installed and works regardless."
+        fi
+    fi
+fi
+
 # pvpn defaults its shim dir to ~/.local/share/protonvpn-torshim for backward
 # compatibility; point it at the installed location instead.
 if grep -q 'protonvpn-torshim' "$BIN/pvpn"; then
