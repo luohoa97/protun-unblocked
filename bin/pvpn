@@ -41,9 +41,24 @@
 
 set -uo pipefail
 
-SHIM="${PVPN_SHIM:-$HOME/.local/share/pvpn}"
-# Backward-compatible fallback if an older install path still exists.
-[[ -d "$SHIM" ]] || SHIM="$HOME/.local/share/protonvpn-torshim"
+# Where the Python helpers live (aiodns shim, sitecustomize, scanner).
+#
+# Resolution order matters because this can be installed three ways:
+#   PVPN_SHIM      explicit override
+#   ~/.local/...   per-user install, via setup.sh
+#   /usr/share/... baked into an OS image, where it is READ-ONLY
+# A per-user copy wins so you can iterate without rebuilding an image.
+if [[ -n "${PVPN_SHIM:-}" ]]; then
+    SHIM="$PVPN_SHIM"
+elif [[ -f "$HOME/.local/share/pvpn/pvpn-scan.py" ]]; then
+    SHIM="$HOME/.local/share/pvpn"
+elif [[ -f "/usr/share/pvpn/pvpn-scan.py" ]]; then
+    SHIM="/usr/share/pvpn"
+elif [[ -d "$HOME/.local/share/protonvpn-torshim" ]]; then
+    SHIM="$HOME/.local/share/protonvpn-torshim"   # older layout
+else
+    SHIM="$HOME/.local/share/pvpn"
+fi
 SETTINGS="$HOME/.config/Proton/VPN/settings.json"
 LOG="${XDG_RUNTIME_DIR:-/tmp}/pvpn-$$.log"
 
@@ -120,11 +135,24 @@ need_tor() {
 }
 
 need_shim() {
-    if [[ ! -f "$SHIM/aiodns.py" ]]; then
-        mkdir -p "$SHIM"
-        printf 'raise ImportError("aiodns disabled so torsocks can proxy DNS via getaddrinfo")\n' \
-            > "$SHIM/aiodns.py"
+    [[ -f "$SHIM/aiodns.py" ]] && return 0
+    # On an image install $SHIM is /usr/share/pvpn and read-only. Writing
+    # there fails, so fall back to a per-user shim rather than dying - but
+    # keep the system copy of the scanner, which is what SCAN points at.
+    if ! mkdir -p "$SHIM" 2>/dev/null || ! touch "$SHIM/.w" 2>/dev/null; then
+        local user_shim="$HOME/.local/share/pvpn"
+        mkdir -p "$user_shim" 2>/dev/null || return 0
+        [[ -f "$SHIM/pvpn-scan.py" && ! -f "$user_shim/pvpn-scan.py" ]] && \
+            cp -f "$SHIM/pvpn-scan.py" "$SHIM/sitecustomize.py" "$user_shim/" 2>/dev/null
+        SHIM="$user_shim"
+        PV_TOR=(torsocks env "PYTHONPATH=$SHIM" PVPN_DEBUG=0 protonvpn)
+        PV_DIRECT=(env "PYTHONPATH=$SHIM" PVPN_DEBUG=0 protonvpn)
+        SCAN="$SHIM/pvpn-scan.py"
     fi
+    rm -f "$SHIM/.w" 2>/dev/null
+    [[ -f "$SHIM/aiodns.py" ]] || printf \
+        'raise ImportError("aiodns disabled so torsocks can proxy DNS via getaddrinfo")\n' \
+        > "$SHIM/aiodns.py" 2>/dev/null
 }
 
 # Which server are we on right now? Empty if disconnected.
