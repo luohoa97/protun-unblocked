@@ -65,6 +65,10 @@ CONNECT_TIMEOUT="${PVPN_TIMEOUT:-30}"
 # UNTOUCHED, so it costs you nothing but time.
 REFRESH_TIMEOUT="${PVPN_REFRESH_TIMEOUT:-600}"
 
+# Budget for the OPPORTUNISTIC pre-connect refresh over Tor. Short on
+# purpose: exceeding it just means we connect with the cached list.
+PRECONNECT_REFRESH_TIMEOUT="${PVPN_PRECONNECT_TIMEOUT:-75}"
+
 # Tried in order by `pvpn try`.
 PROTOCOLS=(protun-tls protun-udp protun-tcp protun-smart openvpn-tcp openvpn-udp wireguard)
 
@@ -383,38 +387,65 @@ unblackhole_api() {
 SERVERLIST="$HOME/.cache/Proton/VPN/serverlist.json"
 STALE_HOURS="${PVPN_STALE_HOURS:-24}"
 
+# Opportunistic refresh, before the tunnel exists.
+#
+# If the list is stale we TRY Tor, because Proton's API domains are blocked
+# here and Tor is the only way to reach them without a tunnel. But this must
+# never block a connect: no Tor, a dead circuit or a slow one all just mean
+# "carry on". Proton's client connects perfectly well with a stale list, and
+# refresh_after_connect() picks up the slack a moment later.
+#
+# Deliberately NOT need_tor(): that exits the whole script when Tor is
+# missing, which would turn a nice-to-have refresh into a hard failure.
+tor_available() {
+    systemctl is-active --quiet tor 2>/dev/null || return 1
+    (exec 3<>/dev/tcp/127.0.0.1/9050) 2>/dev/null || return 1
+    return 0
+}
+
 ensure_fresh_data() {
-    # Only the ABSENCE of a cache is worth blocking a connect for.
-    #
-    # Refreshing over Tor means dragging ~2.5 MB down a Tor circuit, which
-    # measured at several minutes. Doing that merely because the list is a
-    # day old is a bad trade: Proton's client connects perfectly well with
-    # a stale list, and refresh_after_connect() below then updates it in
-    # seconds through the tunnel, where the API is reachable directly.
-    if [[ -s $SERVERLIST ]]; then
-        local age_h=$(( ( $(date +%s) - $(stat -c %Y "$SERVERLIST") ) / 3600 ))
-        say "Server list is ${age_h}h old - connecting now, refresh comes after."
+    local age_h=99999
+    [[ -s $SERVERLIST ]] && \
+        age_h=$(( ( $(date +%s) - $(stat -c %Y "$SERVERLIST") ) / 3600 ))
+
+    if (( age_h < STALE_HOURS )); then
+        say "Server list is ${age_h}h old - no refresh needed."
         return 0
     fi
 
-    need_tor
-    warn "No server list cached yet. Fetching it over Tor - this is a one-off,"
-    warn "and routing is untouched, so your internet keeps working."
-    if timeout "$REFRESH_TIMEOUT" "${PV_TOR[@]}" servers >/dev/null 2>&1 && [[ -s $SERVERLIST ]]; then
-        ok "Server list cached ($(( $(stat -c %s "$SERVERLIST") / 1024 )) KB)."
-    else
-        warn "Could not fetch it. Trying to connect anyway."
+    if ! tor_available; then
+        say "Server list is stale and Tor is not available - connecting anyway."
+        say "  (it will refresh through the tunnel once you are connected)"
+        return 0
     fi
+
+    say "Server list is stale. Trying Tor first (routing untouched, so your"
+    say "internet keeps working). Giving it ${PRECONNECT_REFRESH_TIMEOUT}s, then connecting regardless."
+    local before=0
+    [[ -s $SERVERLIST ]] && before=$(stat -c %Y "$SERVERLIST")
+
+    if timeout "$PRECONNECT_REFRESH_TIMEOUT" "${PV_TOR[@]}" servers >/dev/null 2>&1 \
+       && [[ -s $SERVERLIST ]] && [[ $(stat -c %Y "$SERVERLIST") -gt $before ]]; then
+        ok "Server list refreshed over Tor ($(( $(stat -c %s "$SERVERLIST") / 1024 )) KB)."
+    elif [[ -s $SERVERLIST ]]; then
+        say "Tor refresh did not finish in time - connecting with the cached list."
+    else
+        warn "No server list and Tor could not fetch one. The connect may fail."
+    fi
+    return 0
 }
 
-# Once the tunnel is up, Proton's API is reachable directly - verified:
-# vpn-api.proton.me returns HTTP 200 through the tunnel while returning
-# nothing at all beside it. That makes this the cheapest possible moment to
-# refresh, and it removes Tor from the connect path entirely.
+# Opportunistic refresh, now that the tunnel exists.
 #
-# Best-effort on purpose: `protonvpn servers` does NOT force a refresh (it
-# reads cache and returns in ~1s), so we nudge the client and re-check the
-# mtime rather than claiming success we cannot verify.
+# This is the cheap moment: vpn-api.proton.me answers HTTP 200 through the
+# tunnel while returning nothing at all beside it, so no Tor is involved and
+# it takes seconds rather than minutes.
+#
+# Any Proton command makes the client re-check its own staleness and refresh
+# if it decides to - VERIFIED: a `protonvpn status` on a 1h-old list printed
+# "Server list is outdated, updating..." and left the list 0h old. There is
+# no documented way to force it, so we nudge it and confirm by mtime instead
+# of asserting a success we cannot see.
 refresh_after_connect() {
     [[ -s $SERVERLIST ]] || return 0
     local age_h before
@@ -422,11 +453,11 @@ refresh_after_connect() {
     (( age_h < STALE_HOURS )) && return 0
 
     before=$(stat -c %Y "$SERVERLIST")
-    timeout 90 "${PV_DIRECT[@]}" servers >/dev/null 2>&1 || true
+    timeout "${PVPN_POSTCONNECT_TIMEOUT:-90}" "${PV_DIRECT[@]}" status >/dev/null 2>&1 || true
     if [[ $(stat -c %Y "$SERVERLIST") -gt $before ]]; then
         ok "Server list refreshed through the tunnel."
     else
-        say "(server list still ${age_h}h old; the client refreshes on its own schedule)"
+        say "(list still ${age_h}h old - the client refreshes on its own schedule)"
     fi
 }
 
@@ -587,56 +618,90 @@ cmd_scan() {
 }
 
 # Scan, then hop to the fastest.
-cmd_best() {
-    [[ -f "$SCAN" ]] || { err "scanner missing at $SCAN - re-run setup.sh"; return 1; }
-    local was_connected=0
-    if is_connected; then
-        was_connected=1
-        say "Disconnecting so probes measure this network, not the tunnel..."
-        pv disconnect >/dev/null 2>&1; sleep 2
-    fi
+# Kept as an alias: `pvpn up` already picks the best server. One code path.
+cmd_best() { cmd_up "$@"; }
 
-    say "Probing servers${1:+ matching '$1'}..."
-    # Take the whole ranked list, not just the winner. Staking everything on
-    # the single fastest server means one transient failure ends the command
-    # - which is exactly what happened with JP-FREE#4, a server that
-    # connects fine when tried again.
-    local ranked
-    ranked="$(/usr/bin/python3 "$SCAN" "${1:-}" --json 2>/dev/null \
-        | /usr/bin/python3 -c 'import json,sys
-try:
-    for r in json.load(sys.stdin):
-        print(r["name"])
-except Exception:
-    pass')"
+# Ranked, cached server picks.
+#
+# Scanning costs 30-60s, so a fresh scan on every `pvpn up` would be a bad
+# trade. Results are cached per-filter for PVPN_SCAN_TTL minutes (default
+# 60): latency between you and a datacentre does not swing minute to minute,
+# and load only breaks ties. `pvpn up --rescan` forces a fresh one.
+SCAN_CACHE_DIR="$HOME/.cache/pvpn"
 
-    if [[ -z "$ranked" ]]; then
-        err "Scan found nothing reachable."
-        (( was_connected )) && cmd_up
-        return 1
-    fi
-
-    local n=0 max="${PVPN_BEST_TRIES:-4}"
-    while read -r srv; do
-        [[ -n "$srv" ]] || continue
-        (( n++ )); (( n > max )) && break
-        if (( n == 1 )); then
-            ok "Fastest: ${srv}"
-        else
-            warn "Falling back to #${n} by latency: ${srv}"
-        fi
-        if cmd_hop "$srv"; then
-            return 0
-        fi
-    done <<< "$ranked"
-
-    err "None of the top ${max} servers would connect."
-    (( was_connected )) && cmd_up
-    return 1
+# Which network are we on? Latency to a datacentre is a property of the
+# PATH, so a ranking taken on school wifi tells you nothing at home, and a
+# cached one from the wrong network is worse than none. Falls back to the
+# gateway for wired links, then to a constant.
+current_network_id() {
+    local ssid gw
+    ssid="$(nmcli -t -f ACTIVE,SSID device wifi 2>/dev/null | awk -F: '$1=="yes"{print $2; exit}')"
+    if [[ -n "$ssid" ]]; then printf 'wifi-%s' "$ssid"; return; fi
+    gw="$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')"
+    if [[ -n "$gw" ]]; then printf 'gw-%s' "$gw"; return; fi
+    printf 'unknown'
 }
 
+ranked_servers() {
+    local filter="${1:-}" force="${2:-0}" key cache age_m net
+    net="$(current_network_id)"
+    key="$(printf '%s@%s' "${filter:-_any}" "$net" | tr -c 'A-Za-z0-9_.@-' '_')"
+    cache="$SCAN_CACHE_DIR/scan-${key}.json"
+    mkdir -p "$SCAN_CACHE_DIR"
+
+    if [[ "$force" != 1 && -s "$cache" ]]; then
+        age_m=$(( ( $(date +%s) - $(stat -c %Y "$cache") ) / 60 ))
+        if (( age_m < ${PVPN_SCAN_TTL:-60} )); then
+            note "using scan from ${age_m}m ago on ${net#*-} (--rescan to redo)"
+            /usr/bin/python3 -c 'import json,sys
+try:
+    for r in json.load(open(sys.argv[1])): print(r["name"])
+except Exception: pass' "$cache"
+            return 0
+        fi
+    fi
+
+    say "Ranking servers${filter:+ matching '''$filter'''} by latency and load..." >&2
+    if ! /usr/bin/python3 "$SCAN" ${filter:+"$filter"} --json > "$cache" 2>/dev/null \
+       || [[ ! -s "$cache" ]]; then
+        rm -f "$cache"
+        return 1
+    fi
+    /usr/bin/python3 -c 'import json,sys
+try:
+    for r in json.load(open(sys.argv[1])): print(r["name"])
+except Exception: pass' "$cache"
+}
+
+# pvpn up [filter|protocol] [--rescan|--any]
+#
+# One command. By default it picks the BEST server it can reach rather than
+# whatever Proton hands out, because free-tier assignment ignores where you
+# are - this connection has been given Miami, Dallas and Houston from
+# Australia. A filter narrows the field: `pvpn up japan`, `pvpn up tokyo`,
+# `pvpn up JP,SG`.
+#
+# The old `best` and `hop <filter>` still work and now just call through to
+# here, so there is one code path rather than three that drift apart.
 cmd_up() {
-    local proto="${1:-}"
+    local arg proto="" filter="" force=0 skip_scan=0
+    for arg in "$@"; do
+        case "$arg" in
+            --rescan) force=1 ;;
+            --any|--no-scan) skip_scan=1 ;;
+            "") ;;
+            *)
+                # A protocol name means "use this protocol"; anything else is
+                # a server filter. Keeps `pvpn up protun-tls` working.
+                if printf '%s\n' "${PROTOCOLS[@]}" | grep -qx -- "$arg"; then
+                    proto="$arg"
+                else
+                    filter="$arg"
+                fi
+                ;;
+        esac
+    done
+    [[ "${PVPN_NO_SCAN:-0}" == 1 ]] && skip_scan=1
     # Deliberately NOT need_tor here. Connecting goes straight to Proton's
     # server IP and works with Tor stopped. Tor is only required if the
     # cached server list has gone stale, and ensure_fresh_data checks it
@@ -684,7 +749,7 @@ cmd_up() {
 
     # Ctrl-C or any early exit must put routing back - and must always undo
     # the /etc/hosts edit, or the API would stay broken after we exit.
-    trap 'echo; warn "Interrupted - restoring your connection..."; unblackhole_api; restore; cleanup_log; exit 130' INT TERM
+    trap 'echo; warn "Interrupted - restoring your connection..."; unblackhole_api; restore_cache; restore; cleanup_log; exit 130' INT TERM
 
     # Retries are a LAST resort, not the main mechanism.
     #
@@ -697,11 +762,39 @@ cmd_up() {
     #
     # Attempts remain for the case where a server really is dead, since
     # Proton sometimes does hand out a different one.
+    # Work out WHICH servers to try, in order. Without this we just take
+    # whatever Proton hands out, which on a free account ignores geography
+    # entirely - this connection has been handed Miami, Dallas and Houston
+    # from Australia on consecutive attempts.
+    local -a TARGETS=()
+    if (( ! skip_scan )) && [[ -f "$SCAN" ]]; then
+        mapfile -t TARGETS < <(ranked_servers "$filter" "$force")
+        if (( ${#TARGETS[@]} )); then
+            ok "Best pick: ${TARGETS[0]}${filter:+  (matching '$filter')}"
+        elif [[ -n "$filter" ]]; then
+            err "Nothing matched '$filter'. Try:  pvpn scan"
+            return 1
+        fi
+    fi
+
     local attempts="${PVPN_ATTEMPTS:-3}" rc=0 n=0
+    # With a ranked list, each attempt is a DIFFERENT server, so retrying is
+    # worth more than it is bare - bare retries often land on the same host.
+    (( ${#TARGETS[@]} )) && attempts=$(( ${#TARGETS[@]} < ${PVPN_ATTEMPTS:-3} ? ${#TARGETS[@]} : ${PVPN_ATTEMPTS:-3} ))
+
     while (( n < attempts )); do
         (( n++ ))
-        (( n > 1 )) && { say "Attempt ${n}/${attempts} - reconnecting (may be the same server)..."
+        (( n > 1 )) && { say "Attempt ${n}/${attempts} - reconnecting..."
                          pv disconnect >/dev/null 2>&1; sleep 2; }
+
+        # Steer Proton to the server we chose by hiding the others in its
+        # own cache. Free accounts refuse --country, --random and by-ID, so
+        # this is the only lever available.
+        if (( ${#TARGETS[@]} )); then
+            local target="${TARGETS[$(( n - 1 ))]}"
+            (( n > 1 )) && say "  next by rank: ${target}"
+            steer_cache only "$target" >/dev/null 2>&1 || true
+        fi
 
         rc=0
         timeout "$CONNECT_TIMEOUT" "${PV_DIRECT[@]}" connect >"$LOG" 2>&1 || rc=$?
@@ -713,6 +806,7 @@ cmd_up() {
             local where; where=$(grep -oE 'Connected to [^.]*' "$LOG" | head -1)
             say "  ${where:-tunnel up} - checking traffic..."
             if net_works_settled; then
+                restore_cache
                 trap cleanup_log EXIT INT TERM
                 ok "Connected via ${proto}."
                 cmd_ip
@@ -722,6 +816,7 @@ cmd_up() {
             # Do NOT tear this down. Every tunnel we ever declared dead was
         # simply slow, and demolishing it costs a full reconnect and often
         # lands on the same server anyway. Keep it and say so plainly.
+        restore_cache
         warn "No traffic yet after ${PVPN_SETTLE:-90}s. Keeping the tunnel:"
         warn "  in testing these have come good shortly afterwards."
         say  "  check with:  pvpn status   |   give up with:  pvpn down"
@@ -970,7 +1065,14 @@ usage() {
     cat <<'EOF'
 pvpn - simple Proton VPN control
 
-  pvpn up [protocol]   connect (optionally forcing a protocol)
+  pvpn up [filter]     connect to the BEST server (default), e.g.
+                         pvpn up            fastest reachable anywhere
+                         pvpn up japan      fastest in Japan
+                         pvpn up tokyo      fastest in Tokyo
+                         pvpn up JP,SG      fastest across Japan/Singapore
+                         pvpn up --rescan   ignore the cached ranking
+                         pvpn up --any      skip ranking, let Proton choose
+                         pvpn up protun-tls force a protocol
   pvpn hop [match]     switch server; optionally one matching e.g. JP, SG-FREE#12
   pvpn scan [match]    rank servers by measured latency (probes in parallel)
   pvpn best [match]    scan, then connect to the fastest
@@ -1012,10 +1114,10 @@ EOF
 }
 
 case "${1:-help}" in
-    up|connect)      shift; cmd_up "${1:-}" ;;
-    hop|next)        shift; cmd_hop "${1:-}" ;;
+    up|connect)      shift; cmd_up "$@" ;;
+    hop|next)        shift; cmd_hop "$@" ;;
     scan)            shift; cmd_scan "${1:-}" ;;
-    best|fastest)    shift; cmd_best "${1:-}" ;;
+    best|fastest)    shift; cmd_best "$@" ;;
     down|disconnect) cmd_down ;;
     status|st)       cmd_status ;;
     ip)              cmd_ip ;;

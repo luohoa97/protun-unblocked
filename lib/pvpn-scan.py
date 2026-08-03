@@ -151,6 +151,18 @@ def probe(entry, samples=2, timeout=6.0):
     return (name, ip, load, city, best)
 
 
+def score(ms, load):
+    """Lower is better. Latency, penalised by how busy the server is.
+
+    load is 0-100. At 0% the score is the raw latency; at 100% it is
+    doubled. So load only ever reorders servers that are close in latency,
+    which is the intent - it should break ties, not override geography.
+    """
+    if load is None or load < 0:
+        load = 50
+    return ms * (1.0 + load / 100.0)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Rank Proton free servers by measured latency.",
@@ -160,6 +172,9 @@ def main():
     ap.add_argument("--samples", type=int, default=2)
     ap.add_argument("--workers", type=int, default=24)
     ap.add_argument("--top", type=int, default=10)
+    ap.add_argument("--rank", choices=("score", "latency"), default="score",
+                    help="score (default) weights latency by server load; "
+                         "latency sorts on the raw handshake time")
     ap.add_argument("--limit", type=int, default=80,
                     help="probe at most this many, lowest reported load first")
     ap.add_argument("--quiet", action="store_true", help="print only the winner")
@@ -189,7 +204,11 @@ def main():
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         results = list(ex.map(lambda c: probe(c, args.samples), cand))
 
-    live = sorted([r for r in results if r[4] is not None], key=lambda r: r[4])
+    if args.rank == "latency":
+        live = sorted([r for r in results if r[4] is not None], key=lambda r: r[4])
+    else:
+        live = sorted([r for r in results if r[4] is not None],
+                      key=lambda r: score(r[4], r[2]))
     dead = [r for r in results if r[4] is None]
 
     if not live:
@@ -198,7 +217,8 @@ def main():
 
     if args.json:
         json.dump([
-            {"name": n, "ip": ip, "load": load, "city": city, "ms": round(ms, 1)}
+            {"name": n, "ip": ip, "load": load, "city": city,
+             "ms": round(ms, 1), "score": round(score(ms, load), 1)}
             for n, ip, load, city, ms in live
         ], sys.stdout)
         return

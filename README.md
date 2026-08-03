@@ -85,8 +85,27 @@ refreshes for that host go through Tor automatically (`socks5h://127.0.0.1:9050`
 ```bash
 vpn-check          # is a VPN even possible on this network?
 pvpn login         # once
-pvpn up            # connect
+pvpn up            # connect to the fastest server it can reach
+pvpn up japan      # ...the fastest one in Japan
+pvpn up tokyo      # ...or in Tokyo
+pvpn up JP,SG      # ...across several places
+pvpn up --rescan   # ignore the cached ranking and re-measure
+pvpn up --any      # skip ranking entirely, let Proton choose
 ```
+
+`up` is the whole interface. It ranks servers and connects to the best one,
+falling down the list if one will not come up, so there is no separate
+"connect" / "pick a country" / "find the fastest" to remember.
+
+Why rank at all: free accounts get whatever server Proton hands out, which
+ignores geography — from Australia this connection was assigned Miami,
+Dallas and Houston on consecutive attempts. Proton refuses `--country`,
+`--random` and by-ID on the free tier, so `pvpn` steers by hiding the other
+servers in the client's own cache.
+
+Rankings are **cached per network** (`wifi-<ssid>`, or the gateway on
+wired). Latency is a property of the path, so a ranking measured at school
+is meaningless at home, and reusing it would be worse than not caching.
 
 `vpn-check` reports whether Proton's servers are reachable, whether UDP can
 leave, and whether DNS is hijacked — so you know if the problem is the network

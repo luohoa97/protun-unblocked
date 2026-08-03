@@ -170,6 +170,14 @@ fn build_ui(app: &adw::Application) {
     connect_btn.add_css_class("suggested-action");
     connect_btn.add_css_class("pill");
 
+    // `pvpn up` ranks and picks the best server by itself, so this is
+    // "connect to the fastest", with --rescan to ignore the cached ranking.
+    let fastest_btn = gtk::Button::with_label("Fastest");
+    fastest_btn.add_css_class("pill");
+    fastest_btn.set_tooltip_text(Some(
+        "Re-measure servers now and connect to the fastest one",
+    ));
+
     let hop_btn = gtk::Button::with_label("Hop");
     hop_btn.add_css_class("pill");
     hop_btn.set_tooltip_text(Some("Switch to a different server"));
@@ -177,6 +185,7 @@ fn build_ui(app: &adw::Application) {
     let btn_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     btn_row.set_halign(gtk::Align::Center);
     btn_row.append(&connect_btn);
+    btn_row.append(&fastest_btn);
     btn_row.append(&hop_btn);
 
     let spinner = gtk::Spinner::new();
@@ -247,6 +256,7 @@ fn build_ui(app: &adw::Application) {
         let spinner = spinner.clone();
         let busy_label = busy_label.clone();
         let connect_btn = connect_btn.clone();
+        let fastest_btn = fastest_btn.clone();
         let hop_btn = hop_btn.clone();
         let scan_btn = scan_btn.clone();
         move |busy: bool, what: &str| {
@@ -255,6 +265,7 @@ fn build_ui(app: &adw::Application) {
             busy_label.set_visible(busy);
             busy_label.set_text(what);
             connect_btn.set_sensitive(!busy);
+            fastest_btn.set_sensitive(!busy);
             hop_btn.set_sensitive(!busy);
             scan_btn.set_sensitive(!busy);
         }
@@ -266,8 +277,10 @@ fn build_ui(app: &adw::Application) {
         let tx = tx.clone();
         let set_busy = set_busy.clone();
         let btn = connect_btn.clone();
+        let filter_row_c = filter_row.clone();
         connect_btn.connect_clicked(move |_| {
             let disconnecting = btn.label().map(|l| l == "Disconnect").unwrap_or(false);
+            let filter = filter_row_c.text().to_string();
             set_busy(
                 true,
                 if disconnecting {
@@ -278,7 +291,35 @@ fn build_ui(app: &adw::Application) {
             );
             let tx = tx.clone();
             std::thread::spawn(move || {
-                let r = run_pvpn(&[if disconnecting { "down" } else { "up" }]);
+                let f = filter.trim().to_string();
+                let r = if disconnecting {
+                    run_pvpn(&["down"])
+                } else if f.is_empty() {
+                    run_pvpn(&["up"])
+                } else {
+                    run_pvpn(&["up", &f])
+                };
+                let _ = tx.send_blocking(Msg::Done(r));
+            });
+        });
+    }
+
+    // Fastest: force a fresh ranking, then connect to the winner.
+    {
+        let tx = tx.clone();
+        let set_busy = set_busy.clone();
+        let filter_row = filter_row.clone();
+        fastest_btn.connect_clicked(move |_| {
+            let filter = filter_row.text().to_string();
+            set_busy(true, "Measuring servers, then connecting to the fastest...");
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let f = filter.trim().to_string();
+                let r = if f.is_empty() {
+                    run_pvpn(&["up", "--rescan"])
+                } else {
+                    run_pvpn(&["up", &f, "--rescan"])
+                };
                 let _ = tx.send_blocking(Msg::Done(r));
             });
         });
@@ -336,6 +377,7 @@ fn build_ui(app: &adw::Application) {
         let status_page = status_page.clone();
         let connect_btn = connect_btn.clone();
         let hop_btn = hop_btn.clone();
+        let fastest_btn = fastest_btn.clone();
         let results = results.clone();
         let toasts = toasts.clone();
         let set_busy = set_busy.clone();
@@ -358,6 +400,7 @@ fn build_ui(app: &adw::Application) {
                             connect_btn.remove_css_class("suggested-action");
                             connect_btn.add_css_class("destructive-action");
                             hop_btn.set_sensitive(true);
+                            fastest_btn.set_sensitive(true);
                         } else {
                             status_page.set_icon_name(Some("network-vpn-disabled-symbolic"));
                             status_page.set_title("Disconnected");
