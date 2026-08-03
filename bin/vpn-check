@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
 # vpn-check - will a VPN work on the wifi I'm on right now?
 # Run it on any network. No arguments, nothing to configure.
+#
+#   vpn-check                 human-readable report
+#   vpn-check --machine FILE  also write KEY=value results to FILE (for setup.sh)
+#
 set -uo pipefail
+
+MACHINE_OUT=""
+if [[ "${1:-}" == "--machine" ]]; then
+  MACHINE_OUT="${2:-}"
+  [[ -n "$MACHINE_OUT" ]] || { echo "usage: vpn-check --machine FILE" >&2; exit 2; }
+fi
+
+write_machine() {
+  [[ -n "$MACHINE_OUT" ]] || return 0
+  cat >"$MACHINE_OUT"
+}
 
 c(){ printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
 ok(){ c '1;32' "  PASS  $1"; }; bad(){ c '1;31' "  FAIL  $1"; }; note(){ c '0;37' "        $1"; }
@@ -11,10 +26,25 @@ c '1;36' "Network: ${SSID:-unknown}   $(ip -4 route show default | awk '{print "
 echo
 
 pass=0; fail=0
+INTERNET=0; PROTON_TCP=0; UDP=0; DNS_HIJACK=0
+DNS_SERVER=""
 
 # 1. Baseline: is the internet up at all?
-if curl -s --max-time 8 -o /dev/null https://github.com; then ok "basic internet"; ((pass++))
-else bad "no internet at all - nothing else matters"; exit 1; fi
+if curl -s --max-time 8 -o /dev/null https://github.com; then
+  ok "basic internet"; ((pass++)); INTERNET=1
+else
+  bad "no internet at all - nothing else matters"
+  write_machine <<EOF
+internet=0
+proton_tcp=0
+udp=0
+dns_hijack=0
+dns_server=''
+ssid=$(printf '%q' "${SSID:-}")
+verdict=no_internet
+EOF
+  exit 1
+fi
 
 # 2. Proton VPN server IPs on TCP/443. These are real Proton endpoints; if a
 #    TLS handshake completes, the provider is not IP-blocked here.
@@ -23,9 +53,12 @@ for ip in 156.47.78.177 212.104.101.106 89.187.170.159; do
   if timeout 12 openssl s_client -connect "$ip:443" -servername www.google.com </dev/null 2>&1 \
        | grep -q 'BEGIN CERTIFICATE'; then protok=1; break; fi
 done
-if ((protok)); then ok "Proton VPN servers reachable on TCP/443"; ((pass++))
-else bad "Proton VPN server IPs are dropped on TCP/443"; ((fail++))
-     note "the network blocks the provider by address - Stealth/OpenVPN-TCP cannot help"; fi
+if ((protok)); then
+  ok "Proton VPN servers reachable on TCP/443"; ((pass++)); PROTON_TCP=1
+else
+  bad "Proton VPN server IPs are dropped on TCP/443"; ((fail++))
+  note "the network blocks the provider by address - Stealth/OpenVPN-TCP cannot help"
+fi
 
 # 3. General UDP egress, using a non-Google STUN server (Google is often
 #    allowlisted for Meet, which would give a false pass).
@@ -43,23 +76,45 @@ for host in ("stun.cloudflare.com","stun.nextcloud.com"):
         finally: s.close()
 sys.exit(1)
 PY
-then ok "general UDP egress works"; ((pass++))
-else bad "UDP blocked except to allowlisted hosts"; ((fail++))
-     note "kills WireGuard/OpenVPN-UDP and all online gaming"; fi
+then
+  ok "general UDP egress works"; ((pass++)); UDP=1
+else
+  bad "UDP blocked except to allowlisted hosts"; ((fail++))
+  note "usually the wifi filter (not your laptop firewall)"
+  note "kills WireGuard/OpenVPN-UDP — use Stealth (protun-tls) instead"
+fi
 
 # 4. Is DNS forced to a local resolver?
 DNS=$(resolvectl status 2>/dev/null | awk '/Current DNS Server/{print $NF; exit}')
+DNS_SERVER="${DNS:-}"
 if [[ $DNS =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]]; then
-  bad "DNS forced to local resolver ($DNS)"; ((fail++))
-else ok "DNS not hijacked (${DNS:-unknown})"; ((pass++)); fi
+  bad "DNS forced to local resolver ($DNS)"; ((fail++)); DNS_HIJACK=1
+else
+  ok "DNS not hijacked (${DNS:-unknown})"; ((pass++))
+fi
 
 echo
+VERDICT="ok"
 if ((fail==0)); then
   c '1;32' "VERDICT: a VPN should work here. Try:  pvpn up"
+  VERDICT="ok"
 elif ((protok)); then
   c '1;33' "VERDICT: partly filtered. Proton is reachable, so try:  pvpn try"
+  note "prefer Stealth (TCP/443):  pvpn up protun-tls"
+  VERDICT="partial"
 else
   c '1;31' "VERDICT: VPNs are blocked by address on this network."
   note "Not fixable from this machine, on any OS. Try another SSID"
   note "(doe-guest / BYOD) or a phone hotspot, then run vpn-check again."
+  VERDICT="blocked"
 fi
+
+write_machine <<EOF
+internet=$INTERNET
+proton_tcp=$PROTON_TCP
+udp=$UDP
+dns_hijack=$DNS_HIJACK
+dns_server=$(printf '%q' "$DNS_SERVER")
+ssid=$(printf '%q' "${SSID:-}")
+verdict=$VERDICT
+EOF

@@ -96,7 +96,18 @@ if os.environ.get("PVPN_DEBUG", "1") != "0":
 from proton.vpn.cli import app                      # noqa: E402
 from proton.vpn.cli.core.controller import Params   # noqa: E402
 
+try:
+    from proton.session.exceptions import ProtonAPIError
+except Exception:  # noqa: BLE001
+    ProtonAPIError = ()  # type: ignore
+
 args = sys.argv[1:] or ["signin"]
+
+
+def _is_captcha(exc: BaseException) -> bool:
+    text = str(exc)
+    return "CAPTCHA" in text.upper() or "9001" in text
+
 
 try:
     app(
@@ -108,7 +119,27 @@ try:
 except KeyboardInterrupt:
     print("\nAborted.", file=sys.stderr)
     sys.exit(130)
+except ProtonAPIError as exc:
+    if _is_captcha(exc):
+        print(
+            "\nProton requires a CAPTCHA for this sign-in.\n"
+            "The Linux CLI cannot complete CAPTCHAs (common via Tor).\n"
+            "Handing off to the browser sign-in bridge...\n",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    print("\n=========== REAL TRACEBACK ===========", file=sys.stderr)
+    traceback.print_exc()
+    sys.exit(1)
 except BaseException:  # noqa: BLE001 - the whole point is to see it
+    if _is_captcha(sys.exc_info()[1] or Exception()):
+        print(
+            "\nProton requires a CAPTCHA — CLI cannot complete it.\n"
+            "Sign in once on a phone hotspot/home wifi, then use\n"
+            "pvpn up protun-tls on the filtered network.\n",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     print("\n=========== REAL TRACEBACK ===========", file=sys.stderr)
     traceback.print_exc()
     sys.exit(1)

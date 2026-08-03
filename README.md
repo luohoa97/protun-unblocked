@@ -46,10 +46,17 @@ Every check here uses `curl --noproxy '*'`.
 git clone https://github.com/luohoa97/protun-unblocked.git && cd protun-unblocked && ./setup.sh
 ```
 
-Installs only under `$HOME`. `./setup.sh --uninstall` removes it. You need
-`proton-vpn-cli` and NetworkManager; setup.sh checks and tells you what's
-missing. `tor` + `torsocks` are needed only if Proton's API is blocked where
-you are.
+`setup.sh` detects **apt** (Debian/Ubuntu) or **dnf** (Fedora), installs
+`proton-vpn-cli` + Tor/NetworkManager deps, then installs `pvpn` under `$HOME`
+and walks you through `vpn-check` → `pvpn login` → `pvpn up`.
+
+If `repo.protonvpn.com` is blocked, the Proton repo package and apt/dnf
+refreshes for that host go through Tor automatically (`socks5h://127.0.0.1:9050`).
+
+```bash
+./setup.sh --no-wizard   # install only, skip login prompts
+./setup.sh --uninstall   # remove ~/.local pvpn files
+```
 
 ## Usage
 
@@ -100,8 +107,10 @@ before you spend time on the client.
   `vpn-check`; if it says VPNs are blocked by address, that's the answer, on
   any OS.
 - Free tier gives no server choice, so latency is luck.
-- UDP-blocking networks kill WireGuard and OpenVPN-UDP. Stealth (`protun-tls`)
-  rides TCP/443 and is the protocol that tends to survive.
+- UDP-blocking / DPI networks kill WireGuard, OpenVPN-UDP, and often OpenVPN-TCP
+  (TCP connects, TLS handshake dies). **Stealth (`protun-tls`) is the default**
+  and the protocol that survives — needs `python3-proton-vpn-lib` +
+  `proton-vpn-linux` (NM protun plugin; currently in Proton unstable).
 - `PVPN_FAST=1` is the least-tested path — it edits `/etc/hosts` and removes
   its own block on exit, but verify `/etc/hosts` if it's ever killed with -9.
 
