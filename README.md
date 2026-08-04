@@ -40,6 +40,38 @@ naive checks measure the proxy rather than the tunnel — and a proxy's circuits
 break the instant the tunnel takes over routing, so a working VPN looks dead.
 Every check here uses `curl --noproxy '*'`.
 
+## Two installs: stable and development
+
+The image ships a stable copy in `/usr`, and `~/.local` shadows it because
+`~/.local/bin` comes first on `PATH`. So you can hack on it without
+rebuilding an image, and without losing a working VPN if the checkout breaks.
+
+```bash
+./setup.sh --dev      # symlink the checkout: edits are live, no reinstall
+./setup.sh            # normal copy install
+pvpn version          # which one is running, and from where
+```
+
+`pvpn version` exists because "which one am I running?" has a real answer
+worth printing:
+
+```
+pvpn
+  running : ~/.local/bin/pvpn
+            -> ~/Projects/pvpn/bin/pvpn  (DEV symlink - edits are live)
+  helpers : ~/.local/share/pvpn  (user)
+  system  : /usr/bin/pvpn  (installed, shadowed by the above)
+  source  : ~/Projects/pvpn @ 3da0534-dirty
+```
+
+`--dev` matters more than it looks: a plain install *copies* the scripts, so
+the copy silently drifts the moment you edit the repo — which is a very good
+way to spend an hour debugging a fix you already made.
+
+To fall back to the system copy, remove the links (`rm ~/.local/bin/pvpn`) or
+run `/usr/bin/pvpn` directly. `PVPN_SHIM=/usr/share/pvpn` forces the system
+helpers independently of which script you run.
+
 ## GUI
 
 A libadwaita front-end, in Rust:

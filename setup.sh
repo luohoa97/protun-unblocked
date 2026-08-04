@@ -39,6 +39,12 @@ set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$HOME/.local/bin"
 LIB="$HOME/.local/share/pvpn"
+
+# ./setup.sh --dev  -> symlink the checkout rather than copy it, so edits in
+# the repo are live. Keeps a stable /usr/bin/pvpn from the image and a
+# working copy in ~/.local side by side; ~/.local/bin wins on PATH.
+PVPN_DEV=0
+for _a in "$@"; do [[ "$_a" == "--dev" ]] && PVPN_DEV=1; done
 TMPDIR="${TMPDIR:-/tmp}"
 WORKDIR="$(mktemp -d "$TMPDIR/pvpn-setup.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -54,6 +60,8 @@ for arg in "$@"; do
         --uninstall)   # handled below
             ;;
         --no-wizard)   NO_WIZARD=1 ;;
+        --dev)         PVPN_DEV=1 ;;
+        --gui)         ;;   # consumed later, in install_pvpn
         -h|--help)
             sed -n '3,16p' "$0" | sed 's/^# \?//'
             exit 0
@@ -405,6 +413,27 @@ install_proton() {
 # --- pvpn files -------------------------------------------------------
 
 install_pvpn() {
+    # --dev links the checkout instead of copying it, so editing the repo
+    # takes effect immediately. Without this you get a COPY, which silently
+    # drifts from the repo the moment you change anything - the exact way to
+    # spend an hour debugging a fix you already made.
+    #
+    # This is also how you keep a stable system pvpn and a working one side
+    # by side: ~/.local/bin comes before /usr/bin on PATH, so the dev link
+    # wins, and `pvpn version` tells you which is running.
+    if [[ "${PVPN_DEV:-0}" == 1 ]]; then
+        head_ "Installing pvpn (DEV: symlinked to $SRC)"
+        mkdir -p "$BIN" "$LIB"
+        ln -sfn "$SRC/bin/pvpn"      "$BIN/pvpn";      ok "$BIN/pvpn -> repo"
+        ln -sfn "$SRC/bin/vpn-check" "$BIN/vpn-check"; ok "$BIN/vpn-check -> repo"
+        for f in sitecustomize.py aiodns.py pvpn-scan.py signin-bridge.py debug-signin.py; do
+            [[ -f "$SRC/lib/$f" ]] && ln -sfn "$SRC/lib/$f" "$LIB/$f"
+        done
+        ok "$LIB/*.py -> repo"
+        note "edits in $SRC are live; no reinstall needed"
+        return 0
+    fi
+
     head_ "Installing pvpn"
     mkdir -p "$BIN" "$LIB"
     install -m755 "$SRC/bin/pvpn"      "$BIN/pvpn";      ok "$BIN/pvpn"
@@ -417,12 +446,6 @@ install_pvpn() {
         install -m755 "$SRC/lib/signin-bridge.py" "$LIB/" && ok "$LIB/signin-bridge.py"
     install -m755 "$SRC/lib/pvpn-scan.py"   "$LIB/";   ok "$LIB/pvpn-scan.py"
 
-    # pvpn defaults its shim dir to ~/.local/share/protonvpn-torshim for
-    # backward compatibility; point it at the installed location instead.
-    if grep -q 'protonvpn-torshim' "$BIN/pvpn"; then
-        sed -i "s|\$HOME/.local/share/protonvpn-torshim|\$HOME/.local/share/pvpn|g" "$BIN/pvpn"
-        ok "shim path set to $LIB"
-    fi
 
     case ":$PATH:" in
         *":$BIN:"*) ok "$BIN already on PATH" ;;
@@ -693,7 +716,7 @@ install_pvpn
 # Skipped unless you ask for it: it needs a Rust toolchain and pulls the
 # gtk4/libadwaita crates, which is a few minutes of compiling. The CLI is
 # fully functional without it.
-if [[ "${1:-}" == "--gui" ]]; then
+if [[ " $* " == *" --gui "* ]]; then
     if ! command -v cargo >/dev/null; then
         note "--gui needs a Rust toolchain (cargo). Skipping the GUI."
     elif ! pkg-config --exists gtk4 libadwaita-1 2>/dev/null; then

@@ -916,6 +916,55 @@ cmd_down() {
     else warn "Disconnected, but the network looks down. Try: nmcli con up detnsw"; fi
 }
 
+# Which pvpn is this, and where is it reading its helpers from?
+#
+# There are deliberately two installs: the image ships a stable copy in
+# /usr, and a working copy in ~/.local shadows it because ~/.local/bin comes
+# first on PATH. That is what makes development possible without rebuilding
+# an image - but it also means "which one am I running?" has a real answer
+# that is worth printing rather than guessing.
+cmd_version() {
+    local self bin shim_kind
+    self="$(command -v pvpn 2>/dev/null || echo "$0")"
+    bin="$(readlink -f "$self" 2>/dev/null || echo "$self")"
+
+    say "pvpn"
+    if [[ -L "$self" ]]; then
+        ok  "  running : $self"
+        say "            -> $bin  (DEV symlink - edits are live)"
+    else
+        say "  running : $self"
+        [[ "$bin" != "$self" ]] && say "            -> $bin"
+    fi
+
+    case "$SHIM" in
+        "$HOME"/*) shim_kind="user" ;;
+        /usr/*)    shim_kind="system" ;;
+        *)         shim_kind="custom" ;;
+    esac
+    say "  helpers : $SHIM  ($shim_kind)"
+
+    # Is a system copy also installed, and is it being shadowed?
+    if [[ -x /usr/bin/pvpn ]]; then
+        if [[ "$bin" == /usr/bin/pvpn ]]; then
+            say "  system  : /usr/bin/pvpn  (this one)"
+        else
+            say "  system  : /usr/bin/pvpn  (installed, shadowed by the above)"
+        fi
+    else
+        say "  system  : not installed (rebase the image to get it)"
+    fi
+
+    # If this is a checkout, say which commit - the whole point of a dev
+    # copy is knowing it differs from what shipped.
+    local src ref
+    src="$(dirname "$(dirname "$bin")")"
+    if [[ -d "$src/.git" ]]; then
+        ref="$(git -C "$src" describe --always --dirty 2>/dev/null)"
+        say "  source  : $src @ ${ref:-unknown}"
+    fi
+}
+
 cmd_status() {
     local s; s="$(pv status 2>/dev/null | head -3)"
     say "${s:-Status: unknown}"
@@ -1156,6 +1205,7 @@ pvpn - simple Proton VPN control
   pvpn logout          sign out (same as: pvpn account --logout)
   pvpn try             try every protocol, stop at the first that works
   pvpn protocols       which backends are actually available here
+  pvpn version         which install is running, and from where
   pvpn help            this message
 
 Account:
@@ -1191,6 +1241,7 @@ case "${1:-help}" in
     best|fastest)    shift; cmd_best "$@" ;;
     down|disconnect) cmd_down ;;
     status|st)       cmd_status ;;
+    version|--version|-V) cmd_version ;;
     ip)              cmd_ip ;;
     login|signin)    shift; cmd_login "$@" ;;
     account|acct)    shift; cmd_account "${1:-}" ;;
