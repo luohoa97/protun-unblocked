@@ -31,8 +31,9 @@
 #
 # Why this wrapper exists:
 #   * Proton's API is blocked on this network, so account/API traffic is
-#     routed through Tor (torsocks) with an aiodns shim that forces
-#     aiohttp onto its threaded resolver (torsocks cannot proxy UDP DNS).
+#     routed through Tor (torsocks). lib/sitecustomize.py points aiohttp
+#     at its threaded resolver, because torsocks cannot proxy the UDP
+#     that aiodns uses.
 #   * `protonvpn connect` installs a full-tunnel route the moment it
 #     STARTS connecting, not when it succeeds. If the tunnel never comes
 #     up, all traffic blackholes until it gives up ~2 minutes later.
@@ -41,7 +42,7 @@
 
 set -uo pipefail
 
-# Where the Python helpers live (aiodns shim, sitecustomize, scanner).
+# Where the Python helpers live (sitecustomize, scanner).
 #
 # Resolution order matters because this can be installed three ways:
 #   PVPN_SHIM      explicit override
@@ -101,7 +102,11 @@ err()  { printf '%s%s%s\n' "$R" "$*" "$X" >&2; }
 note() { printf '  %s\n' "$*" >&2; }
 
 cleanup_log() { rm -f "$LOG"; }
-trap cleanup_log EXIT
+
+# Nothing persistent to undo any more: server steering is an in-memory
+# override (see steer_env below), so a crash leaves no state behind.
+on_exit() { cleanup_log; }
+trap on_exit EXIT
 
 # --- plumbing ---------------------------------------------------------
 
@@ -135,7 +140,6 @@ need_tor() {
 }
 
 need_shim() {
-    [[ -f "$SHIM/aiodns.py" ]] && return 0
     # On an image install $SHIM is /usr/share/pvpn and read-only. Writing
     # there fails, so fall back to a per-user shim rather than dying - but
     # keep the system copy of the scanner, which is what SCAN points at.
@@ -150,9 +154,6 @@ need_shim() {
         SCAN="$SHIM/pvpn-scan.py"
     fi
     rm -f "$SHIM/.w" 2>/dev/null
-    [[ -f "$SHIM/aiodns.py" ]] || printf \
-        'raise ImportError("aiodns disabled so torsocks can proxy DNS via getaddrinfo")\n' \
-        > "$SHIM/aiodns.py" 2>/dev/null
 }
 
 # Which server are we on right now? Empty if disconnected.
@@ -530,62 +531,27 @@ refresh_after_connect() {
 # failure, or Ctrl-C. It is also refetched periodically, so an edit that
 # somehow survived would be corrected anyway.
 SERVERLIST="$HOME/.cache/Proton/VPN/serverlist.json"
-CACHE_BAK=""
-
-restore_cache() {
-    [[ -n "$CACHE_BAK" && -f "$CACHE_BAK" ]] || return 0
-    mv -f "$CACHE_BAK" "$SERVERLIST" 2>/dev/null
-    CACHE_BAK=""
-}
-
-# steer_cache <mode> <pattern>
-#   exclude <name>    - hide exactly this server
-#   only    <pattern> - hide every free server the filter does not select
+# Server steering is an OVERRIDE, not a write.
 #
-# The "only" filter is resolved by lib/pvpn-scan.py --names, so `hop` and
-# `scan` share one matcher and one alias table. That is why `hop japan`,
-# `hop tokyo` and `hop JP,SG` all work the same way `scan` does.
-steer_cache() {
-    local mode="$1" pat="$2" allow=""
-    [[ -s "$SERVERLIST" ]] || { err "No cached server list. Run: pvpn up"; return 1; }
-
-    if [[ "$mode" == only ]]; then
-        allow="$(/usr/bin/python3 "$SCAN" "$pat" --names 2>/dev/null)"
-        if [[ -z "$allow" ]]; then
-            err "No free server matches '${pat}'."
-            say "  try: pvpn scan   (to see what exists)"
-            return 1
-        fi
-    fi
-
-    CACHE_BAK="${SERVERLIST}.pvpn-bak"
-    cp -f "$SERVERLIST" "$CACHE_BAK" || { CACHE_BAK=""; return 1; }
-
-    MODE="$mode" PAT="$pat" ALLOW="$allow" SL="$SERVERLIST" /usr/bin/python3 - <<'PYIN'
-import json, os, sys, pathlib
-mode = os.environ["MODE"]
-pat = os.environ["PAT"].upper()
-allow = {n.strip().upper() for n in os.environ.get("ALLOW", "").splitlines() if n.strip()}
-p = pathlib.Path(os.environ["SL"])
-d = json.loads(p.read_text())
-key = "LogicalServers" if "LogicalServers" in d else "Servers"
-kept = hidden = 0
-for srv in d[key]:
-    name = (srv.get("Name") or "").upper()
-    if "FREE" not in name:
-        continue                  # paid servers are unreachable to us anyway
-    hide = (pat in name) if mode == "exclude" else (name not in allow)
-    if hide:
-        srv["Status"] = 0
-        hidden += 1
-    else:
-        kept += 1
-if kept == 0:
-    sys.stderr.write("filter left no candidates\n")
-    sys.exit(2)
-p.write_text(json.dumps(d))
-print(f"{kept} candidate server(s), {hidden} hidden")
-PYIN
+# A free account cannot pick a server (--country, --random and by-ID are all
+# refused), so the only lever is which servers the client believes are
+# online. The tempting way to pull it is to edit ~/.cache/.../serverlist.json
+# and put it back afterwards.
+#
+# That was the old approach and it was wrong. Editing the real cache means a
+# crash between "hide the others" and "restore" leaves the Proton client
+# permanently convinced most of the network is offline, with nothing to
+# explain why. Backups, stale markers and EXIT traps narrow that window but
+# cannot close it - SIGKILL beats all of them, and so does a power cut.
+#
+# lib/sitecustomize.py instead patches ServerList.from_dict, the single
+# funnel every load passes through, and applies PVPN_ONLY / PVPN_EXCLUDE in
+# memory for the lifetime of one process. The file is never touched, so
+# there is no backup to restore, no marker to check, no window to crash in,
+# and nothing to corrupt. A crash just means the override stops applying.
+steer_env() {
+    local target="${1:-}"
+    [[ -n "$target" ]] && printf 'PVPN_ONLY=%s' "$target"
 }
 
 # Move to a different server, optionally a specific one.
@@ -598,32 +564,39 @@ PYIN
 cmd_hop() {
     need_shim
     local want="${1:-}" before after rc
+    local steer=()
 
     before="$(current_server)"
     [[ -n "$before" ]] && say "Currently on: $before"
 
     if [[ -n "$want" ]]; then
+        # Resolve the filter to concrete names with the shared matcher, so
+        # `hop japan` and `scan japan` can never disagree.
+        local names
+        names="$(/usr/bin/python3 "$SCAN" "$want" --names 2>/dev/null | paste -sd, -)"
+        if [[ -z "$names" ]]; then
+            err "No free server matches '${want}'."
+            say "  try: pvpn scan   (to see what exists)"
+            return 1
+        fi
         say "Target: servers matching '${want}'"
-        steer_cache only "$want" || { restore_cache; return 1; }
+        steer=(env "PVPN_ONLY=$names")
     else
         [[ -n "$before" ]] || { warn "Not connected - just connecting."; cmd_up; return $?; }
-        # status prints "NAME in City, Country"; the cache holds only NAME.
-        steer_cache exclude "${before%% in *}" || { restore_cache; return 1; }
+        # status prints "NAME in City, Country"; the list holds only NAME.
+        steer=(env "PVPN_EXCLUDE=${before%% in *}")
     fi
 
-    trap 'echo; warn "Interrupted - restoring..."; restore_cache; restore; cleanup_log; exit 130' INT TERM
+    trap 'echo; warn "Interrupted - restoring..."; restore; exit 130' INT TERM
 
     pv disconnect >/dev/null 2>&1
     sleep 2
     rc=0
-    timeout "$CONNECT_TIMEOUT" "${PV_DIRECT[@]}" connect >"$LOG" 2>&1 || rc=$?
-    # Put Proton's data back before doing anything else.
-    restore_cache
-
+    timeout "$CONNECT_TIMEOUT" "${steer[@]}" "${PV_DIRECT[@]}" connect >"$LOG" 2>&1 || rc=$?
     if (( rc != 0 )) || ! is_connected; then
         err "Hop failed to connect."
         grep -iE 'error|failed|not available' "$LOG" | tail -2
-        trap cleanup_log EXIT INT TERM
+        trap on_exit EXIT INT TERM
         warn "Restoring your normal connection..."
         restore && ok "Internet restored." || err "Still down - try: pvpn down"
         return 1
@@ -632,14 +605,14 @@ cmd_hop() {
     after="$(current_server)"
     say "  landed on ${after} - checking traffic..."
     if net_works_settled; then
-        trap cleanup_log EXIT INT TERM
+        trap on_exit EXIT INT TERM
         ok "Hopped${before:+: ${before%% in *} ->} ${after}"
         cmd_ip
         refresh_after_connect
         return 0
     fi
 
-    trap cleanup_log EXIT INT TERM
+    trap on_exit EXIT INT TERM
     warn "${after} has not passed traffic yet after ${PVPN_SETTLE:-90}s."
     warn "Keeping it - slow starts are normal here and it may come good."
     say  "  check with:  pvpn status   |   move on with:  pvpn hop   |   stop:  pvpn down"
@@ -804,7 +777,7 @@ cmd_up() {
 
     # Ctrl-C or any early exit must put routing back - and must always undo
     # the /etc/hosts edit, or the API would stay broken after we exit.
-    trap 'echo; warn "Interrupted - restoring your connection..."; unblackhole_api; restore_cache; restore; cleanup_log; exit 130' INT TERM
+    trap 'echo; warn "Interrupted - restoring your connection..."; unblackhole_api; restore; exit 130' INT TERM
 
     # Retries are a LAST resort, not the main mechanism.
     #
@@ -845,14 +818,15 @@ cmd_up() {
         # Steer Proton to the server we chose by hiding the others in its
         # own cache. Free accounts refuse --country, --random and by-ID, so
         # this is the only lever available.
+        local steer=()
         if (( ${#TARGETS[@]} )); then
             local target="${TARGETS[$(( n - 1 ))]}"
             (( n > 1 )) && say "  next by rank: ${target}"
-            steer_cache only "$target" >/dev/null 2>&1 || true
+            steer=(env "PVPN_ONLY=$target")
         fi
 
         rc=0
-        timeout "$CONNECT_TIMEOUT" "${PV_DIRECT[@]}" connect >"$LOG" 2>&1 || rc=$?
+        timeout "$CONNECT_TIMEOUT" "${steer[@]}" "${PV_DIRECT[@]}" connect >"$LOG" 2>&1 || rc=$?
         # Undo the hosts edit the moment the connect is over, whatever
         # happened. Once the tunnel is up the API is reachable through it.
         unblackhole_api
@@ -861,8 +835,7 @@ cmd_up() {
             local where; where=$(grep -oE 'Connected to [^.]*' "$LOG" | head -1)
             say "  ${where:-tunnel up} - checking traffic..."
             if net_works_settled; then
-                restore_cache
-                trap cleanup_log EXIT INT TERM
+                trap on_exit EXIT INT TERM
                 ok "Connected via ${proto}."
                 cmd_ip
                 refresh_after_connect
@@ -871,11 +844,10 @@ cmd_up() {
             # Do NOT tear this down. Every tunnel we ever declared dead was
         # simply slow, and demolishing it costs a full reconnect and often
         # lands on the same server anyway. Keep it and say so plainly.
-        restore_cache
         warn "No traffic yet after ${PVPN_SETTLE:-90}s. Keeping the tunnel:"
         warn "  in testing these have come good shortly afterwards."
         say  "  check with:  pvpn status   |   give up with:  pvpn down"
-        trap cleanup_log EXIT INT TERM
+        trap on_exit EXIT INT TERM
         cmd_ip
         return 0
         else
@@ -902,9 +874,9 @@ cmd_up() {
             fi
         fi
     done
-    trap cleanup_log EXIT INT TERM
+    trap on_exit EXIT INT TERM
 
-    trap cleanup_log EXIT INT TERM
+    trap on_exit EXIT INT TERM
     warn "Restoring your normal connection..."
     if restore; then ok "Internet restored."; else err "Internet still down - try: pvpn down"; fi
     return 1

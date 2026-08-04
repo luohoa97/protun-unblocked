@@ -125,3 +125,105 @@ try:
 
 except Exception:
     pass
+
+# --- 4. In-memory server steering ---------------------------------------
+#
+# A free Proton account cannot choose its server: --country, --random and
+# by-ID are all refused. The only lever is which servers the client believes
+# are online, and the obvious way to pull it is to edit the cached
+# serverlist.json.
+#
+# Do NOT do that. Editing it means the user's real cache is mutated, so a
+# crash between "hide the others" and "put them back" leaves the Proton
+# client permanently convinced most of the network is offline, with nothing
+# to explain why. Backups, markers and traps only narrow that window; they
+# cannot close it, and a SIGKILL beats all of them.
+#
+# So this is an OVERRIDE instead of a write. ServerList.from_dict is the one
+# funnel every load passes through - cache reads and fresh API responses
+# alike - so filtering there applies our choice in memory, for the lifetime
+# of one process, while the file on disk is never touched. A crash simply
+# means the override stops applying. There is nothing to clean up and
+# nothing to corrupt.
+#
+#   PVPN_ONLY="JP-FREE#5,JP-FREE#8"   treat only these as online
+#   PVPN_EXCLUDE="US-FREE#15"         treat these as offline
+try:
+    from proton.vpn.session.servers.logicals import ServerList
+
+    _only = {n.strip().upper() for n in os.environ.get("PVPN_ONLY", "").split(",") if n.strip()}
+    _excl = {n.strip().upper() for n in os.environ.get("PVPN_EXCLUDE", "").split(",") if n.strip()}
+
+    if _only or _excl:
+        _orig_from_dict = ServerList.from_dict.__func__
+
+        @classmethod
+        def _steered_from_dict(cls, data):
+            try:
+                rows = data.get("LogicalServers")
+                if isinstance(rows, list):
+                    kept = 0
+                    # Copy the row dicts we change, so we never mutate the
+                    # caller's structure - it may be the parsed cache that
+                    # something else still holds a reference to.
+                    new_rows = []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            new_rows.append(row)
+                            continue
+                        name = (row.get("Name") or "").upper()
+                        # Only steer among FREE servers; the rest are
+                        # unreachable on this tier regardless.
+                        if "FREE" not in name:
+                            new_rows.append(row)
+                            continue
+                        hide = (name in _excl) if _excl else (name not in _only)
+                        if hide:
+                            row = dict(row)
+                            row["Status"] = 0
+                        else:
+                            kept += 1
+                        new_rows.append(row)
+                    # Never steer the client into having nothing to pick.
+                    if kept:
+                        data = dict(data)
+                        data["LogicalServers"] = new_rows
+            except Exception:
+                pass  # a steering failure must never break connecting
+            return _orig_from_dict(cls, data)
+
+        ServerList.from_dict = _steered_from_dict
+
+except Exception:
+    pass
+
+# --- 5. DNS resolver, so torsocks can actually proxy lookups -------------
+#
+# torsocks intercepts connect() and getaddrinfo(), but it CANNOT proxy UDP -
+# Tor does not carry UDP. aiohttp defaults to AsyncResolver whenever aiodns
+# is installed, and aiodns does its own raw UDP DNS, which torsocks blocks.
+# Result: "Could not contact DNS servers" and login fails over Tor.
+#
+# The previous fix was a fake `aiodns` module on PYTHONPATH that raised
+# ImportError, exploiting aiohttp's documented fallback. It worked, but it
+# shadowed a real package for EVERY process sharing that PYTHONPATH -
+# verified: `import aiodns` raised for anything run with it. That is too
+# blunt.
+#
+# aiohttp.connector does `from .resolver import DefaultResolver` at import,
+# so rebinding aiohttp.resolver.DefaultResolver does nothing - verified, the
+# connector still saw AsyncResolver. The binding that matters is the one in
+# connector. Patching it there flips exactly one thing and touches no other
+# package. Verified: AsyncResolver -> ThreadedResolver, live request HTTP 204.
+#
+# ThreadedResolver uses getaddrinfo, which torsocks does intercept.
+try:
+    import aiohttp.connector as _conn
+    from aiohttp.resolver import ThreadedResolver as _Threaded
+
+    if os.environ.get("PVPN_FORCE_THREADED_DNS", "1") != "0":
+        _conn.DefaultResolver = _Threaded
+except Exception:
+    # If aiohttp renames this, we degrade to its default rather than break.
+    # Login over Tor would fail again, loudly, rather than silently.
+    pass

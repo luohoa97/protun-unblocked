@@ -200,7 +200,7 @@ base_deps_present() {
 }
 
 pvpn_installed() {
-    [[ -x "$BIN/pvpn" && -x "$BIN/vpn-check" && -f "$LIB/sitecustomize.py" && -f "$LIB/aiodns.py" ]]
+    [[ -x "$BIN/pvpn" ]] && [[ -f "$LIB/pvpn-scan.py" ]] && [[ -f "$LIB/sitecustomize.py" ]]
 }
 
 everything_ready() {
@@ -426,7 +426,7 @@ install_pvpn() {
         mkdir -p "$BIN" "$LIB"
         ln -sfn "$SRC/bin/pvpn"      "$BIN/pvpn";      ok "$BIN/pvpn -> repo"
         ln -sfn "$SRC/bin/vpn-check" "$BIN/vpn-check"; ok "$BIN/vpn-check -> repo"
-        for f in sitecustomize.py aiodns.py pvpn-scan.py signin-bridge.py debug-signin.py; do
+        for f in sitecustomize.py pvpn-scan.py signin-bridge.py debug-signin.py; do
             [[ -f "$SRC/lib/$f" ]] && ln -sfn "$SRC/lib/$f" "$LIB/$f"
         done
         ok "$LIB/*.py -> repo"
@@ -439,7 +439,6 @@ install_pvpn() {
     install -m755 "$SRC/bin/pvpn"      "$BIN/pvpn";      ok "$BIN/pvpn"
     install -m755 "$SRC/bin/vpn-check" "$BIN/vpn-check"; ok "$BIN/vpn-check"
     install -m644 "$SRC/lib/sitecustomize.py" "$LIB/";   ok "$LIB/sitecustomize.py"
-    install -m644 "$SRC/lib/aiodns.py"        "$LIB/";   ok "$LIB/aiodns.py"
     [[ -f "$SRC/lib/debug-signin.py" ]] && \
         install -m755 "$SRC/lib/debug-signin.py" "$LIB/" && ok "$LIB/debug-signin.py"
     [[ -f "$SRC/lib/signin-bridge.py" ]] && \
