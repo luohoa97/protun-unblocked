@@ -156,6 +156,13 @@ need_shim() {
     rm -f "$SHIM/.w" 2>/dev/null
 }
 
+# Is an account signed in? `protonvpn info` prints "Account: 'x@proton.me'"
+# when it is, and nothing useful when it is not.
+is_logged_in() {
+    pv info 2>/dev/null | awk -F"'" '/^Account:/{print $2; exit}' \
+        | grep -qvE '^(None)?$'
+}
+
 # Which server are we on right now? Empty if disconnected.
 current_server() {
     pv status 2>/dev/null | sed -n 's/^Server:[[:space:]]*//p' | head -1
@@ -234,10 +241,73 @@ PY
 # fallback when the NM protun plugin is missing. Note this is NOT about
 # usually fails anyway.
 # IMPORTANT: only the final protocol name goes to stdout (callers capture $()).
+# Can UDP actually leave this network?
+#
+# Stealth (protun-tls) is TCP-in-TCP, which means head-of-line blocking:
+# fine for browsing, poor for anything latency-sensitive. Plain WireGuard is
+# strictly better WHERE UDP WORKS - so default to it there, and only fall
+# back to Stealth where it does not.
+#
+# Probed with STUN against non-Google servers on purpose. Networks routinely
+# allowlist Google's STUN so Meet keeps working - measured on detnsw, Google
+# STUN answered on both 19302 and 3478 while Cloudflare and Nextcloud STUN
+# timed out. Probing Google would have reported "UDP works" on a network
+# where WireGuard is dead.
+#
+# Cached per network, since it is a property of the path, not the moment.
+udp_egress_works() {
+    local net cache age_h
+    net="$(current_network_id)"
+    cache="$SCAN_CACHE_DIR/udp-${net}"
+    mkdir -p "$SCAN_CACHE_DIR" 2>/dev/null
+    if [[ -f "$cache" ]]; then
+        age_h=$(( ( $(date +%s) - $(stat -c %Y "$cache") ) / 3600 ))
+        if (( age_h < ${PVPN_UDP_TTL_HOURS:-12} )); then
+            [[ "$(cat "$cache")" == yes ]]
+            return $?
+        fi
+    fi
+
+    local result=no
+    if /usr/bin/python3 - <<'PYUDP' 2>/dev/null
+import socket, struct, sys
+tid = b'\x21\x12\xa4\x42' + b'\x0b' * 12
+for host, port in (("stun.cloudflare.com", 3478),
+                   ("stun.nextcloud.com", 443),
+                   ("stun.stunprotocol.org", 3478)):
+    try:
+        ip = socket.gethostbyname(host)
+    except Exception:
+        continue
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(4)
+    try:
+        s.sendto(struct.pack('>HH', 1, 0) + tid, (ip, port))
+        s.recvfrom(2048)
+        sys.exit(0)
+    except Exception:
+        pass
+    finally:
+        s.close()
+sys.exit(1)
+PYUDP
+    then result=yes; fi
+    printf '%s' "$result" > "$cache"
+    [[ "$result" == yes ]]
+}
+
 ensure_connect_protocol() {
     local want="$1" fallback="openvpn-tcp"
     if [[ -z "$want" || "$want" == "unknown" ]]; then
-        want="protun-tls"
+        # No explicit choice: prefer plain WireGuard where UDP can escape,
+        # since Stealth's TCP-in-TCP costs latency for nothing on an
+        # unfiltered network. PVPN_FORCE_STEALTH=1 pins Stealth regardless.
+        if [[ "${PVPN_FORCE_STEALTH:-0}" != 1 ]] && udp_egress_works \
+           && protocol_available wireguard; then
+            say "UDP leaves this network — using plain WireGuard (lower latency)." >&2
+            want="wireguard"
+        else
+            want="protun-tls"
+        fi
     fi
     if protocol_available "$want"; then
         set_protocol "$want"
@@ -650,15 +720,45 @@ SCAN_CACHE_DIR="$HOME/.cache/pvpn"
 
 # Which network are we on? Latency to a datacentre is a property of the
 # PATH, so a ranking taken on school wifi tells you nothing at home, and a
-# cached one from the wrong network is worse than none. Falls back to the
-# gateway for wired links, then to a constant.
+# cached one from the wrong network is worse than none at all.
+#
+# Identifying it is fiddlier than it looks:
+#
+#   SSID alone       collides constantly - every school running "detnsw",
+#                    every Telstra modem shipped with the same default name.
+#   Gateway IP alone useless - 192.168.1.1 is most of the planet.
+#   BSSID            unique per ACCESS POINT, not per network. detnsw showed
+#                    four APs for one network; keying on BSSID would split
+#                    one upstream path into four rankings and re-scan every
+#                    time you walked down a corridor.
+#
+# So: SSID plus the gateway's MAC. The MAC identifies the actual router, so
+# two networks both called "madmaxi" get different keys, while roaming
+# between APs that share a gateway keeps one key. Wired links use the MAC
+# alone. Hashed, because SSIDs contain anything at all and this becomes a
+# filename.
 current_network_id() {
-    local ssid gw
-    ssid="$(nmcli -t -f ACTIVE,SSID device wifi 2>/dev/null | awk -F: '$1=="yes"{print $2; exit}')"
-    if [[ -n "$ssid" ]]; then printf 'wifi-%s' "$ssid"; return; fi
+    local ssid gw mac raw
+    ssid="$(nmcli -t -f ACTIVE,SSID device wifi 2>/dev/null \
+            | awk -F: '$1=="yes"{print $2; exit}')"
     gw="$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')"
-    if [[ -n "$gw" ]]; then printf 'gw-%s' "$gw"; return; fi
-    printf 'unknown'
+
+    # `ip neigh` only knows the gateway once something has talked to it.
+    mac="$(ip neigh show "$gw" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="lladdr") print $(i+1)}' | head -1)"
+    if [[ -z "$mac" && -n "$gw" ]]; then
+        ping -c1 -W1 "$gw" >/dev/null 2>&1
+        mac="$(ip neigh show "$gw" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="lladdr") print $(i+1)}' | head -1)"
+    fi
+
+    raw="${ssid:-wired}|${mac:-${gw:-none}}"
+    if [[ -z "$ssid" && -z "$mac" && -z "$gw" ]]; then
+        printf 'offline'
+        return
+    fi
+    # Short hash keeps the filename sane; the readable prefix keeps the
+    # cache directory greppable when something looks wrong.
+    printf '%s-%s' "${ssid:-wired}" \
+        "$(printf '%s' "$raw" | sha256sum | cut -c1-10)"
 }
 
 ranked_servers() {
@@ -1048,23 +1148,55 @@ EOF
     # sitecustomize defaults PVPN_API_TIMEOUT=2 for connect fail-fast;
     # that value is fatal for login over Tor.
     local api_timeout="${PVPN_LOGIN_API_TIMEOUT:-60}"
-    local -a run
-    if api_reachable; then
-        say "Proton API reachable — signing in directly (no Tor)."
-        run=(env "PYTHONPATH=$SHIM" PVPN_DEBUG=0
-             "PVPN_API_TIMEOUT=$api_timeout")
-    else
-        need_tor
-        warn "API blocked here — signing in via Tor (timeout ${api_timeout}s)."
-        warn "If Proton asks for a CAPTCHA, use:  pvpn login --browser"
-        run=(torsocks env "PYTHONPATH=$SHIM" PVPN_DEBUG=0
-             "PVPN_API_TIMEOUT=$api_timeout")
-    fi
 
-    if [[ -f "$SHIM/debug-signin.py" ]]; then
-        "${run[@]}" /usr/bin/python3 "$SHIM/debug-signin.py" signin "$user" || rc=$?
+    # Transport order: direct -> Proton's own alternative routing -> Tor.
+    #
+    # The first two are ONE attempt, not two: the client's AutoTransport
+    # chain is [(0s, Aiohttp), (5s, AlternativeRouting)], so a plain run
+    # tries direct and then falls through to alternative routing - Proton's
+    # built-in censorship circumvention, via third-party CDNs - by itself.
+    #
+    # The old code gated that on api_reachable(), a plain curl to the API.
+    # But curl only tests the DIRECT path, so a blocked network skipped
+    # straight to Tor and alternative routing never got a chance. Tor works,
+    # but it is slow and its exit nodes trigger Proton's CAPTCHA, which the
+    # CLI cannot solve. It should be the last resort, not the reflex.
+    #
+    # Note the long timeout matters here: sitecustomize sets
+    # PVPN_API_TIMEOUT=2 so connects fail fast, and 2s is far too short for
+    # alternative routing to complete a CDN round trip.
+    run_signin() {
+        local -a run=("$@")
+        if [[ -f "$SHIM/debug-signin.py" ]]; then
+            "${run[@]}" /usr/bin/python3 "$SHIM/debug-signin.py" signin "$user"
+        else
+            "${run[@]}" protonvpn signin "$user"
+        fi
+    }
+
+    if api_reachable; then
+        say "Proton API reachable — signing in directly."
     else
-        "${run[@]}" protonvpn signin "$user" || rc=$?
+        say "API not reachable directly — trying Proton's alternative routing."
+        note "(Tor is the fallback after this, not the first move)"
+    fi
+    rc=0
+    run_signin env "PYTHONPATH=$SHIM" PVPN_DEBUG=0 "PVPN_API_TIMEOUT=$api_timeout" || rc=$?
+
+    # Only a transport failure earns a Tor retry. A wrong password (rc 1
+    # with an auth error) or a CAPTCHA (rc 2) will fail identically over
+    # Tor, and retrying just wastes a minute and burns a CAPTCHA attempt.
+    if (( rc != 0 && rc != 2 )) && ! is_logged_in; then
+        if tor_available; then
+            warn "Direct and alternative routing both failed — retrying over Tor."
+            warn "If Proton asks for a CAPTCHA, use:  pvpn login --browser"
+            rc=0
+            run_signin torsocks env "PYTHONPATH=$SHIM" PVPN_DEBUG=0 \
+                "PVPN_API_TIMEOUT=$api_timeout" || rc=$?
+        else
+            note "Tor is not running, so there is no fallback left."
+            note "Start it with:  sudo systemctl start tor"
+        fi
     fi
 
     # Exit 2 from debug-signin.py = CAPTCHA / human-check required.
