@@ -94,6 +94,29 @@ Optional and skipped by default — it needs `cargo`, `gtk4-devel` and
 `libadwaita-devel`, and the first build compiles the gtk4/libadwaita crates
 (~1 minute). The CLI is fully functional without it.
 
+### Flatpak
+
+```bash
+cd gui && flatpak-builder --user --install --force-clean build flatpak/dev.pvpn.Gui.yml
+flatpak run dev.pvpn.Gui
+```
+
+Be clear-eyed about what this sandbox does. The GUI is a front-end for a
+**host** service: `pvpn` drives NetworkManager over D-Bus, reads
+`~/.cache/Proton`, and runs `torsocks`. None of that works inside a sandbox,
+so every command goes out through `flatpak-spawn --host`, which requires
+`--talk-name=org.freedesktop.Flatpak` — an escape hatch that runs host
+commands with your full user privileges.
+
+So it packages the app; it does not contain it. You still get a pinned
+GNOME 50 runtime, read-only `$HOME`, and one-command install and removal —
+but it is not a security boundary, and pretending otherwise would be worse
+than not shipping it.
+
+If `flatpak-builder` fails at the export step with *"AppStream Compose
+binary ... was not found"*, Homebrew's `appstreamcli` is shadowing the
+system one. Prefix with `PATH=/usr/bin:/usr/sbin:$PATH`.
+
 ## Install
 
 ```bash

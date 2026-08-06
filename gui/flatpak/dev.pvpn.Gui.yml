@@ -1,0 +1,63 @@
+# Flatpak manifest for the pvpn GUI.
+#
+# Read this before assuming the sandbox is buying you much.
+#
+# This app is a front-end for a HOST service. `pvpn` drives NetworkManager
+# over D-Bus, reads ~/.cache/Proton, runs torsocks, and edits routing. None
+# of that can happen inside a sandbox, and none of it should - so the GUI
+# runs every command through `flatpak-spawn --host`, which requires
+# --talk-name=org.freedesktop.Flatpak.
+#
+# That permission is, by design, an escape hatch: anything the app can run
+# on the host, it runs with your full user privileges. So the honest summary
+# is that this packages the app conveniently, it does not contain it. The
+# sandbox still buys real things - a pinned GNOME 50 runtime, no access to
+# your files beyond what is granted, and one-command install/removal - but
+# it is not a security boundary here.
+#
+# Build:  flatpak-builder --user --install --force-clean build flatpak/dev.pvpn.Gui.yml
+# Run:    flatpak run dev.pvpn.Gui
+id: dev.pvpn.Gui
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: pvpn-gui
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  build-args:
+    # cargo fetches crates.io at build time. Vendoring would remove this,
+    # at the cost of committing a large vendor/ tree.
+    - --share=network
+
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+
+  # The whole point: run pvpn on the host. Without this the app starts and
+  # every button fails, because there is no pvpn inside the sandbox.
+  - --talk-name=org.freedesktop.Flatpak
+
+  # $HOME is read so the GUI can locate the host's pvpn-scan.py path. The
+  # scanner itself still executes on the host via flatpak-spawn.
+  - --filesystem=home:ro
+
+modules:
+  - name: pvpn-gui
+    buildsystem: simple
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose || cargo fetch
+      - cargo build --release
+      - install -Dm755 target/release/pvpn-gui /app/bin/pvpn-gui
+      - install -Dm644 data/dev.pvpn.Gui.desktop /app/share/applications/dev.pvpn.Gui.desktop
+      - install -Dm644 data/dev.pvpn.Gui.svg
+        /app/share/icons/hicolor/scalable/apps/dev.pvpn.Gui.svg
+      - install -Dm644 data/dev.pvpn.Gui.metainfo.xml
+        /app/share/metainfo/dev.pvpn.Gui.metainfo.xml
+    sources:
+      - type: dir
+        path: ..

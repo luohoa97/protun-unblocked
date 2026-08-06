@@ -34,8 +34,36 @@ use gtk::glib;
 
 const APP_ID: &str = "dev.pvpn.Gui";
 
+/// Are we running inside a Flatpak sandbox?
+///
+/// The sandbox cannot see the host filesystem or run host binaries, and
+/// `pvpn` is emphatically a host thing: it drives NetworkManager over D-Bus,
+/// reads ~/.cache/Proton, and shells out to torsocks. So inside a sandbox
+/// every command has to go out through `flatpak-spawn --host`, which needs
+/// --talk-name=org.freedesktop.Flatpak in the manifest.
+fn in_flatpak() -> bool {
+    std::path::Path::new("/.flatpak-info").exists()
+}
+
+/// Build a Command that runs on the host, sandboxed or not.
+fn host_command(program: &str) -> Command {
+    if in_flatpak() {
+        let mut c = Command::new("flatpak-spawn");
+        c.arg("--host").arg(program);
+        c
+    } else {
+        Command::new(program)
+    }
+}
+
 /// Where setup.sh puts the CLI.
+///
+/// Inside a sandbox the path check is meaningless - $HOME is the sandbox's
+/// own - so just name the binary and let the host's PATH resolve it.
 fn pvpn_bin() -> String {
+    if in_flatpak() {
+        return "pvpn".to_string();
+    }
     let home = std::env::var("HOME").unwrap_or_default();
     let local = format!("{home}/.local/bin/pvpn");
     if std::path::Path::new(&local).is_file() {
@@ -46,6 +74,9 @@ fn pvpn_bin() -> String {
 }
 
 fn scanner() -> String {
+    // Resolved on the HOST, so use the host's home, not the sandbox's.
+    // $HOME is the real one when --filesystem=home is granted, but the
+    // scanner is invoked via flatpak-spawn either way.
     let home = std::env::var("HOME").unwrap_or_default();
     format!("{home}/.local/share/pvpn/pvpn-scan.py")
 }
@@ -59,7 +90,7 @@ struct Status {
 
 fn read_status() -> Status {
     let mut st = Status::default();
-    let Ok(out) = Command::new(pvpn_bin()).arg("status").output() else {
+    let Ok(out) = host_command(&pvpn_bin()).arg("status").output() else {
         return st;
     };
     let text = String::from_utf8_lossy(&out.stdout);
@@ -88,7 +119,7 @@ struct ServerRow {
 /// Ask the shared Python scanner for ranked results. Probing is the only
 /// part of this that can be parallel; connecting cannot be.
 fn scan(filter: &str) -> Result<Vec<ServerRow>, String> {
-    let mut cmd = Command::new("/usr/bin/python3");
+    let mut cmd = host_command("/usr/bin/python3");
     cmd.arg(scanner());
     if !filter.trim().is_empty() {
         cmd.arg(filter.trim());
@@ -113,7 +144,7 @@ fn scan(filter: &str) -> Result<Vec<ServerRow>, String> {
 }
 
 fn run_pvpn(args: &[&str]) -> Result<String, String> {
-    let out = Command::new(pvpn_bin())
+    let out = host_command(&pvpn_bin())
         .args(args)
         .output()
         .map_err(|e| format!("cannot run pvpn: {e}"))?;

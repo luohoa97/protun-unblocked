@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.pvpn.Gui</id>
+  <name>pvpn</name>
+  <summary>Proton VPN for filtered networks</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="dev.pvpn">
+    <name>Neil Luo</name>
+  </developer>
+  <description>
+    <p>
+      A front-end for the pvpn command-line tool, which makes Proton VPN
+      usable on networks that filter it without leaving you with no
+      internet when a connection attempt fails.
+    </p>
+    <p>
+      It ranks servers by measured latency and load, connects to the best
+      one, and falls down the list if a server will not come up.
+    </p>
+    <p>
+      This application drives pvpn on the host system and requires it to be
+      installed there.
+    </p>
+  </description>
+  <launchable type="desktop-id">dev.pvpn.Gui.desktop</launchable>
+  <content_rating type="oars-1.1"/>
+  <url type="homepage">https://github.com/luohoa97/protun-unblocked</url>
+  <url type="bugtracker">https://github.com/luohoa97/protun-unblocked/issues</url>
+  <releases>
+    <release version="0.1.0" date="2026-08-04"/>
+  </releases>
+</component>
