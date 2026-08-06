@@ -160,11 +160,20 @@ fn build_ui(app: &adw::Application) {
     header.pack_start(&refresh);
 
     // --- status -------------------------------------------------------
-    let status_page = adw::StatusPage::new();
-    status_page.set_icon_name(Some("network-vpn-disabled-symbolic"));
-    status_page.set_title("Disconnected");
-    status_page.set_description(Some("Not connected to Proton VPN"));
-    status_page.set_vexpand(false);
+    // NOT AdwStatusPage. That widget is designed to fill an empty page and
+    // renders an enormous icon, which ate the top half of the window and
+    // pushed the server name off-screen entirely. A single ActionRow says
+    // the same thing in one line and leaves room for the list.
+    let status_icon = gtk::Image::from_icon_name("network-vpn-disabled-symbolic");
+    status_icon.set_pixel_size(32);
+
+    let status_row = adw::ActionRow::new();
+    status_row.set_title("Disconnected");
+    status_row.set_subtitle("Not connected to Proton VPN");
+    status_row.add_prefix(&status_icon);
+
+    let status_group = adw::PreferencesGroup::new();
+    status_group.add(&status_row);
 
     let connect_btn = gtk::Button::with_label("Connect");
     connect_btn.add_css_class("suggested-action");
@@ -223,26 +232,39 @@ fn build_ui(app: &adw::Application) {
     let results_group = adw::PreferencesGroup::new();
     results_group.add(&results);
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.set_margin_top(12);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
-    content.append(&status_page);
-    content.append(&btn_row);
-    content.append(&spinner);
-    content.append(&busy_label);
-    content.append(&filter_group);
-    content.append(&results_group);
+    // Only the server list scrolls. Previously the whole page was inside
+    // the ScrolledWindow, so Connect/Fastest/Hop scrolled away as soon as a
+    // scan returned more than a few servers - you had to scroll back up to
+    // disconnect.
+    let fixed_top = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    fixed_top.set_margin_top(12);
+    fixed_top.set_margin_start(18);
+    fixed_top.set_margin_end(18);
+    fixed_top.append(&status_group);
+    fixed_top.append(&btn_row);
+    fixed_top.append(&spinner);
+    fixed_top.append(&busy_label);
+    fixed_top.append(&filter_group);
+
+    let list_holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    list_holder.set_margin_top(12);
+    list_holder.set_margin_bottom(18);
+    list_holder.set_margin_start(18);
+    list_holder.set_margin_end(18);
+    list_holder.append(&results_group);
 
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
-        .child(&content)
+        .child(&list_holder)
         .build();
 
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.append(&fixed_top);
+    content.append(&scroller);
+
     let toasts = adw::ToastOverlay::new();
-    toasts.set_child(Some(&scroller));
+    toasts.set_child(Some(&content));
 
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
@@ -374,7 +396,8 @@ fn build_ui(app: &adw::Application) {
 
     // --- message pump ----------------------------------------------------
     {
-        let status_page = status_page.clone();
+        let status_row = status_row.clone();
+        let status_icon = status_icon.clone();
         let connect_btn = connect_btn.clone();
         let hop_btn = hop_btn.clone();
         let fastest_btn = fastest_btn.clone();
@@ -388,26 +411,30 @@ fn build_ui(app: &adw::Application) {
                 match msg {
                     Msg::Status(st) => {
                         if st.connected {
-                            status_page.set_icon_name(Some("network-vpn-symbolic"));
-                            status_page.set_title("Connected");
-                            let desc = if st.protocol.is_empty() {
+                            status_icon.set_icon_name(Some("network-vpn-symbolic"));
+                            status_row.set_title("Connected");
+                            // One line, not two: the server and protocol on
+                            // a single subtitle keeps the row compact.
+                            let sub = if st.protocol.is_empty() {
                                 st.server.clone()
                             } else {
-                                format!("{}\n{}", st.server, st.protocol)
+                                format!("{}  •  {}", st.server, st.protocol)
                             };
-                            status_page.set_description(Some(&desc));
+                            status_row.set_subtitle(&sub);
                             connect_btn.set_label("Disconnect");
                             connect_btn.remove_css_class("suggested-action");
                             connect_btn.add_css_class("destructive-action");
                             hop_btn.set_sensitive(true);
                             fastest_btn.set_sensitive(true);
                         } else {
-                            status_page.set_icon_name(Some("network-vpn-disabled-symbolic"));
-                            status_page.set_title("Disconnected");
-                            status_page.set_description(Some("Not connected to Proton VPN"));
+                            status_icon.set_icon_name(Some("network-vpn-disabled-symbolic"));
+                            status_row.set_title("Disconnected");
+                            status_row.set_subtitle("Not connected to Proton VPN");
                             connect_btn.set_label("Connect");
                             connect_btn.remove_css_class("destructive-action");
                             connect_btn.add_css_class("suggested-action");
+                            // Hop is meaningless with no tunnel to hop from.
+                            hop_btn.set_sensitive(false);
                         }
                         set_busy(false, "");
                     }
