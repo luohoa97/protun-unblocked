@@ -906,7 +906,20 @@ cmd_up() {
     elif protocol_available "protun-tls"; then
         set_protocol "protun-tls"
     fi
-    proto="$(current_protocol)"
+    # Deliberately do NOT seed this from settings.json.
+    #
+    # The right protocol is a property of the NETWORK, not a preference.
+    # Stealth (protun-tls) is correct on a filtered network and wrong on an
+    # open one - it is WireGuard inside TLS inside TCP, so it pays
+    # head-of-line blocking for a censorship problem you do not have.
+    #
+    # But settings.json is sticky: connect once at school and it stores
+    # protun-tls, then every connect at home reuses it, because
+    # ensure_connect_protocol only auto-detected when it was handed nothing.
+    # Auto-detection therefore never ran after the first connect, which is
+    # why home wifi kept using Stealth and stalling on rekey timeouts.
+    #
+    # Passing "" lets it pick per network. -p pins a protocol explicitly.
     proto="$(ensure_connect_protocol "$proto")" || return 1
 
     # Do the slow API work FIRST, while routing is still untouched. If the
