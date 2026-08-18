@@ -138,15 +138,26 @@ refreshes for that host go through Tor automatically (`socks5h://127.0.0.1:9050`
 ## Usage
 
 ```bash
-vpn-check          # is a VPN even possible on this network?
-pvpn login         # once
-pvpn up            # connect to the fastest server it can reach
-pvpn up japan      # ...the fastest one in Japan
-pvpn up tokyo      # ...or in Tokyo
-pvpn up JP,SG      # ...across several places
-pvpn up --rescan   # ignore the cached ranking and re-measure
-pvpn up --any      # skip ranking entirely, let Proton choose
+vpn-check                 # is a VPN even possible on this network?
+pvpn login                # once
+pvpn up                   # fastest server it can reach
+pvpn up -c japan          # fastest in Japan
+pvpn up -c JP -c SG       # across several countries
+pvpn up --city tokyo      # by city
+pvpn up -s JP-FREE#5      # one exact server
+pvpn up -p wireguard      # force a protocol
+pvpn up --fastest         # re-measure before choosing
+pvpn up --any             # skip ranking, let Proton choose
 ```
+
+Repeated filters are OR-ed. Bare words still work (`pvpn up japan`), and
+`hop` takes the same flags. Full list: `pvpn up --help`.
+
+**`up` does not wait to confirm traffic.** It returns once the tunnel is up.
+Confirming meant sitting in a probe loop for up to `PVPN_SETTLE` seconds
+*after* the tunnel already existed, for information `pvpn status` gives in
+about 0.3s — and the tunnel was kept either way, since every one written off
+as dead turned out to be merely slow. Pass `--verify` if you want the wait.
 
 `up` is the whole interface. It ranks servers and connects to the best one,
 falling down the list if one will not come up, so there is no separate

@@ -633,7 +633,20 @@ steer_env() {
 #   pvpn hop SG-FREE#12  one exact server
 cmd_hop() {
     need_shim
-    local want="${1:-}" before after rc
+    local want="" before after rc
+    # Same flags as `up`, so there is one vocabulary to learn.
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--country|--city|-s|--server)
+                want="${want:+$want,}${2:?$1 needs a value}"; shift 2 ;;
+            -h|--help)
+                say "pvpn hop [-c COUNTRY] [--city CITY] [-s SERVER]"
+                say "  no filter: any server other than the current one"
+                return 0 ;;
+            -*) err "Unknown flag: $1"; return 1 ;;
+            *)  want="${want:+$want,}$1"; shift ;;
+        esac
+    done
     local steer=()
 
     before="$(current_server)"
@@ -802,25 +815,71 @@ except Exception: pass' "$cache"
 #
 # The old `best` and `hop <filter>` still work and now just call through to
 # here, so there is one code path rather than three that drift apart.
+usage_up() {
+    cat <<'EOF'
+pvpn up - connect, picking the best server it can reach
+
+  -c, --country CODE    JP, japan, US, netherlands ...  (repeatable)
+      --city NAME       tokyo, amsterdam ...            (repeatable)
+  -s, --server NAME     JP-FREE#5                       (repeatable)
+  -p, --protocol NAME   protun-tls (Stealth), wireguard, openvpn-tcp ...
+  -f, --fastest         re-measure servers before choosing
+      --rescan          same as --fastest
+      --any             skip ranking, let Proton choose
+      --verify          wait and confirm traffic passes (slow; off by default)
+  -h, --help            this
+
+Examples
+  pvpn up
+  pvpn up -c japan
+  pvpn up -c JP -c SG --fastest
+  pvpn up --city tokyo
+  pvpn up -s JP-FREE#5
+  pvpn up -p wireguard
+
+Repeated filters are OR-ed. Bare words still work (`pvpn up japan`).
+
+`up` does NOT wait to confirm traffic - it returns once the tunnel is up.
+`pvpn status` tells you whether traffic is actually passing, in ~0.3s.
+EOF
+}
+
 cmd_up() {
-    local arg proto="" filter="" force=0 skip_scan=0
-    for arg in "$@"; do
-        case "$arg" in
-            --rescan) force=1 ;;
-            --any|--no-scan) skip_scan=1 ;;
-            "") ;;
+    local proto="" filter="" force=0 skip_scan=0 verify=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--country)  filter="${filter:+$filter,}${2:?--country needs a value}"; shift 2 ;;
+            --city)        filter="${filter:+$filter,}${2:?--city needs a value}";    shift 2 ;;
+            -s|--server)   filter="${filter:+$filter,}${2:?--server needs a value}";  shift 2 ;;
+            -p|--protocol) proto="${2:?--protocol needs a value}";                    shift 2 ;;
+            -f|--fastest)  force=1; shift ;;
+            --rescan)      force=1; shift ;;
+            --any|--no-scan) skip_scan=1; shift ;;
+            # Confirming traffic means sitting in a probe loop for up to
+            # PVPN_SETTLE seconds after the tunnel is already up. Off by
+            # default: `pvpn up` should return when the tunnel exists.
+            # `pvpn status` reports whether traffic is actually passing, and
+            # costs ~0.3s, which is the right place to find out.
+            --verify)      verify=1; shift ;;
+            --no-verify)   verify=0; shift ;;
+            -h|--help)     usage_up; return 0 ;;
+            --)            shift; break ;;
+            -*)            err "Unknown flag: $1"; say ""; usage_up; return 1 ;;
             *)
-                # A protocol name means "use this protocol"; anything else is
-                # a server filter. Keeps `pvpn up protun-tls` working.
-                if printf '%s\n' "${PROTOCOLS[@]}" | grep -qx -- "$arg"; then
-                    proto="$arg"
+                # Bare words still work so muscle memory does not break:
+                # a protocol name sets the protocol, anything else filters.
+                if printf '%s\n' "${PROTOCOLS[@]}" | grep -qx -- "$1"; then
+                    proto="$1"
                 else
-                    filter="$arg"
+                    filter="${filter:+$filter,}$1"
                 fi
-                ;;
+                shift ;;
         esac
     done
+
     [[ "${PVPN_NO_SCAN:-0}" == 1 ]] && skip_scan=1
+    [[ "${PVPN_VERIFY:-0}" == 1 ]] && verify=1
     # Deliberately NOT need_tor here. Connecting goes straight to Proton's
     # server IP and works with Tor stopped. Tor is only required if the
     # cached server list has gone stale, and ensure_fresh_data checks it
@@ -919,6 +978,15 @@ cmd_up() {
         # own cache. Free accounts refuse --country, --random and by-ID, so
         # this is the only lever available.
         local steer=()
+        # Steering only works if lib/sitecustomize.py is actually the one
+        # on PYTHONPATH. A stale copy there fails SILENTLY: ranking still
+        # names the right server, the connect ignores it, and you land in
+        # another country wondering why. Cost of this check is a grep.
+        if (( ${#TARGETS[@]} )) && ! grep -q 'steered_from_dict' "$SHIM/sitecustomize.py" 2>/dev/null; then
+            warn "Server steering is unavailable: $SHIM/sitecustomize.py is stale"
+            warn "or missing, so Proton will choose the server, not you."
+            note "fix with:  ./setup.sh          (or ./setup.sh --dev in a checkout)"
+        fi
         if (( ${#TARGETS[@]} )); then
             local target="${TARGETS[$(( n - 1 ))]}"
             (( n > 1 )) && say "  next by rank: ${target}"
@@ -933,23 +1001,34 @@ cmd_up() {
 
         if [[ $rc -eq 0 ]] && is_connected; then
             local where; where=$(grep -oE 'Connected to [^.]*' "$LOG" | head -1)
+            trap on_exit EXIT INT TERM
+
+            # Default: report the tunnel and get out of the way.
+            #
+            # Waiting to confirm traffic meant sitting in a probe loop for up
+            # to PVPN_SETTLE seconds AFTER the tunnel already existed - tens
+            # of seconds of staring at "checking traffic..." for information
+            # `pvpn status` gives in about 0.3s. And we never act on a bad
+            # result anyway: the tunnel is kept either way, because every one
+            # we declared dead turned out to be merely slow.
+            if (( ! verify )); then
+                ok "${where:-Connected} via ${proto}."
+                refresh_after_connect
+                return 0
+            fi
+
             say "  ${where:-tunnel up} - checking traffic..."
             if net_works_settled; then
-                trap on_exit EXIT INT TERM
                 ok "Connected via ${proto}."
                 cmd_ip
                 refresh_after_connect
                 return 0
             fi
-            # Do NOT tear this down. Every tunnel we ever declared dead was
-        # simply slow, and demolishing it costs a full reconnect and often
-        # lands on the same server anyway. Keep it and say so plainly.
-        warn "No traffic yet after ${PVPN_SETTLE:-90}s. Keeping the tunnel:"
-        warn "  in testing these have come good shortly afterwards."
-        say  "  check with:  pvpn status   |   give up with:  pvpn down"
-        trap on_exit EXIT INT TERM
-        cmd_ip
-        return 0
+            warn "No traffic yet after ${PVPN_SETTLE:-90}s. Keeping the tunnel:"
+            warn "  in testing these have come good shortly afterwards."
+            say  "  check with:  pvpn status   |   give up with:  pvpn down"
+            cmd_ip
+            return 0
         else
             err "Could not connect via ${proto} (timed out or refused)."
             grep -iE 'error|failed|not available|free plan|No valid implementation|unexpected' "$LOG" | tail -5
@@ -1289,14 +1368,15 @@ usage() {
     cat <<'EOF'
 pvpn - simple Proton VPN control
 
-  pvpn up [filter]     connect to the BEST server (default), e.g.
-                         pvpn up            fastest reachable anywhere
-                         pvpn up japan      fastest in Japan
-                         pvpn up tokyo      fastest in Tokyo
-                         pvpn up JP,SG      fastest across Japan/Singapore
-                         pvpn up --rescan   ignore the cached ranking
-                         pvpn up --any      skip ranking, let Proton choose
-                         pvpn up protun-tls force a protocol
+  pvpn up [flags]      connect to the best server it can reach
+                         -c, --country JP|japan       (repeatable)
+                             --city    tokyo          (repeatable)
+                         -s, --server  JP-FREE#5      (repeatable)
+                         -p, --protocol wireguard|protun-tls|...
+                         -f, --fastest  re-measure first
+                             --any      skip ranking
+                             --verify   confirm traffic (slow, off by default)
+                       see: pvpn up --help
   pvpn hop [match]     switch server; optionally one matching e.g. JP, SG-FREE#12
   pvpn scan [match]    rank servers by measured latency (probes in parallel)
   pvpn best [match]    scan, then connect to the fastest
