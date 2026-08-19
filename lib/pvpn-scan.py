@@ -151,15 +151,32 @@ def probe(entry, samples=2, timeout=6.0):
     return (name, ip, load, city, best)
 
 
-def score(ms, load):
-    """Lower is better. Latency, penalised by how busy the server is.
+def score(ms, load, prefer="balanced"):
+    """Lower is better. What "better" means is the caller's choice.
 
-    load is 0-100. At 0% the score is the raw latency; at 100% it is
-    doubled. So load only ever reorders servers that are close in latency,
-    which is the intent - it should break ties, not override geography.
+    latency   rank on the measured handshake alone. Pick this when round
+              trips are what hurt: games, SSH, video calls. A busy server
+              near you still beats an idle one far away.
+
+    load      rank on how busy the server is, using latency only to break
+              ties. Pick this for sustained throughput - large downloads -
+              where a congested server costs you more than 100ms of
+              distance ever will.
+
+    balanced  latency weighted by load: ms * (1 + load/100). At 0% load the
+              score is the raw latency; at 100% it is doubled. Load only
+              reorders servers that are already close, so it breaks ties
+              rather than overriding geography. This is the default because
+              it is right for browsing, which is most use.
     """
     if load is None or load < 0:
         load = 50
+    if prefer == "latency":
+        return ms
+    if prefer == "load":
+        # Load dominates; latency is the tie-break, scaled small enough that
+        # it cannot outweigh a full percentage point of load.
+        return load * 1000.0 + ms
     return ms * (1.0 + load / 100.0)
 
 
@@ -172,9 +189,13 @@ def main():
     ap.add_argument("--samples", type=int, default=2)
     ap.add_argument("--workers", type=int, default=24)
     ap.add_argument("--top", type=int, default=10)
-    ap.add_argument("--rank", choices=("score", "latency"), default="score",
-                    help="score (default) weights latency by server load; "
-                         "latency sorts on the raw handshake time")
+    ap.add_argument("--rank", "--prefer", dest="rank",
+                    choices=("balanced", "score", "latency", "load"),
+                    default="balanced",
+                    help="balanced (default): latency weighted by load; "
+                         "latency: raw handshake time only; "
+                         "load: least busy first, latency as tie-break "
+                         "('score' is an alias for balanced)")
     ap.add_argument("--limit", type=int, default=80,
                     help="probe at most this many, lowest reported load first")
     ap.add_argument("--quiet", action="store_true", help="print only the winner")
@@ -204,11 +225,9 @@ def main():
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         results = list(ex.map(lambda c: probe(c, args.samples), cand))
 
-    if args.rank == "latency":
-        live = sorted([r for r in results if r[4] is not None], key=lambda r: r[4])
-    else:
-        live = sorted([r for r in results if r[4] is not None],
-                      key=lambda r: score(r[4], r[2]))
+    prefer = "balanced" if args.rank == "score" else args.rank
+    live = sorted([r for r in results if r[4] is not None],
+                  key=lambda r: score(r[4], r[2], prefer))
     dead = [r for r in results if r[4] is None]
 
     if not live:
@@ -218,7 +237,8 @@ def main():
     if args.json:
         json.dump([
             {"name": n, "ip": ip, "load": load, "city": city,
-             "ms": round(ms, 1), "score": round(score(ms, load), 1)}
+             "ms": round(ms, 1),
+             "score": round(score(ms, load, prefer), 1)}
             for n, ip, load, city, ms in live
         ], sys.stdout)
         return

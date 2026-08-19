@@ -61,6 +61,19 @@ else
     SHIM="$HOME/.local/share/pvpn"
 fi
 SETTINGS="$HOME/.config/Proton/VPN/settings.json"
+
+# Your standing preferences. Plain KEY=value, read at startup, overridden by
+# flags. Kept separate from Proton's settings.json because that file belongs
+# to their client and gets rewritten by it.
+PVPN_CONF="${PVPN_CONF:-$HOME/.config/pvpn/config}"
+# shellcheck source=/dev/null
+[[ -r "$PVPN_CONF" ]] && source "$PVPN_CONF"
+
+# How to choose between servers when several are reachable:
+#   latency   raw handshake time. Games, SSH, calls - round trips hurt.
+#   load      least busy first, latency as tie-break. Big downloads.
+#   balanced  latency weighted by load. Right for browsing, so it is default.
+PREFER="${PVPN_PREFER:-${prefer:-balanced}}"
 LOG="${XDG_RUNTIME_DIR:-/tmp}/pvpn-$$.log"
 
 # How long to wait for a tunnel before giving up and restoring routing.
@@ -777,7 +790,11 @@ current_network_id() {
 ranked_servers() {
     local filter="${1:-}" force="${2:-0}" key cache age_m net
     net="$(current_network_id)"
-    key="$(printf '%s@%s' "${filter:-_any}" "$net" | tr -c 'A-Za-z0-9_.@-' '_')"
+    # PREFER is part of the key: the same servers ranked by latency and by
+    # load are different answers, and serving one from the other's cache
+    # would silently ignore the preference you set.
+    key="$(printf '%s@%s@%s' "${filter:-_any}" "$net" "$PREFER" \
+           | tr -c 'A-Za-z0-9_.@-' '_')"
     cache="$SCAN_CACHE_DIR/scan-${key}.json"
     mkdir -p "$SCAN_CACHE_DIR"
 
@@ -794,7 +811,7 @@ except Exception: pass' "$cache"
     fi
 
     say "Ranking servers${filter:+ matching \"$filter\"} by latency and load..." >&2
-    if ! /usr/bin/python3 "$SCAN" ${filter:+"$filter"} --json > "$cache" 2>/dev/null \
+    if ! /usr/bin/python3 "$SCAN" ${filter:+"$filter"} --rank "$PREFER" --json > "$cache" 2>/dev/null \
        || [[ ! -s "$cache" ]]; then
         rm -f "$cache"
         return 1
@@ -815,6 +832,59 @@ except Exception: pass' "$cache"
 #
 # The old `best` and `hop <filter>` still work and now just call through to
 # here, so there is one code path rather than three that drift apart.
+# Read or set a standing preference.
+#
+#   pvpn config                 show everything
+#   pvpn config prefer          show one key
+#   pvpn config prefer latency  set it
+#
+# Writes ~/.config/pvpn/config, which is sourced at startup. Flags still
+# win for a single run, so this is a default and not a lock.
+cmd_config() {
+    local key="${1:-}" val="${2:-}"
+
+    if [[ -z "$key" ]]; then
+        say "config: $PVPN_CONF"
+        if [[ -r "$PVPN_CONF" ]]; then
+            sed 's/^/  /' "$PVPN_CONF"
+        else
+            say "  (none set)"
+        fi
+        say ""
+        say "  prefer = $PREFER"
+        return 0
+    fi
+
+    if [[ -z "$val" ]]; then
+        case "$key" in
+            prefer) say "$PREFER" ;;
+            *)      err "Unknown key: $key"; return 1 ;;
+        esac
+        return 0
+    fi
+
+    case "$key" in
+        prefer)
+            case "$val" in
+                latency|load|balanced) ;;
+                *) err "prefer must be latency, load or balanced"; return 1 ;;
+            esac ;;
+        *) err "Unknown key: $key"; say "  known keys: prefer"; return 1 ;;
+    esac
+
+    mkdir -p "$(dirname "$PVPN_CONF")"
+    touch "$PVPN_CONF"
+    # Replace the key if present, append if not - without a regex on the
+    # file, and atomically, so an interrupted write cannot truncate it.
+    local tmp; tmp="$(mktemp "${PVPN_CONF}.XXXXXX")"
+    grep -v "^${key}=" "$PVPN_CONF" > "$tmp" 2>/dev/null || true
+    printf '%s=%s\n' "$key" "$val" >> "$tmp"
+    mv -f "$tmp" "$PVPN_CONF"
+    ok "$key = $val"
+    say "  (ranking caches are keyed by preference, so this takes effect"
+    say "   on the next scan rather than reusing the old order)"
+}
+
 usage_up() {
     cat <<'EOF'
 pvpn up - connect, picking the best server it can reach
@@ -823,6 +893,9 @@ pvpn up - connect, picking the best server it can reach
       --city NAME       tokyo, amsterdam ...            (repeatable)
   -s, --server NAME     JP-FREE#5                       (repeatable)
   -p, --protocol NAME   protun-tls (Stealth), wireguard, openvpn-tcp ...
+      --prefer WHICH    latency | load | balanced   (default balanced)
+      --latency         short for --prefer latency
+      --load            short for --prefer load
   -f, --fastest         re-measure servers before choosing
       --rescan          same as --fastest
       --any             skip ranking, let Proton choose
@@ -839,6 +912,13 @@ Examples
 
 Repeated filters are OR-ed. Bare words still work (`pvpn up japan`).
 
+Ranking preference
+  latency   raw handshake time - games, SSH, calls
+  load      least busy first   - large downloads
+  balanced  latency weighted by load - browsing (default)
+
+Set it permanently:  pvpn config prefer latency
+
 `up` does NOT wait to confirm traffic - it returns once the tunnel is up.
 `pvpn status` tells you whether traffic is actually passing, in ~0.3s.
 EOF
@@ -853,6 +933,9 @@ cmd_up() {
             --city)        filter="${filter:+$filter,}${2:?--city needs a value}";    shift 2 ;;
             -s|--server)   filter="${filter:+$filter,}${2:?--server needs a value}";  shift 2 ;;
             -p|--protocol) proto="${2:?--protocol needs a value}";                    shift 2 ;;
+            --prefer)      PREFER="${2:?--prefer needs latency|load|balanced}"; shift 2 ;;
+            --latency)     PREFER=latency; shift ;;
+            --load)        PREFER=load; shift ;;
             -f|--fastest)  force=1; shift ;;
             --rescan)      force=1; shift ;;
             --any|--no-scan) skip_scan=1; shift ;;
@@ -1402,6 +1485,7 @@ pvpn - simple Proton VPN control
   pvpn logout          sign out (same as: pvpn account --logout)
   pvpn try             try every protocol, stop at the first that works
   pvpn protocols       which backends are actually available here
+  pvpn config [k] [v]  show or set standing preferences (prefer=...)
   pvpn version         which install is running, and from where
   pvpn help            this message
 
@@ -1438,6 +1522,7 @@ case "${1:-help}" in
     best|fastest)    shift; cmd_best "$@" ;;
     down|disconnect) cmd_down ;;
     status|st)       cmd_status ;;
+    config|cfg)      shift; cmd_config "${1:-}" "${2:-}" ;;
     version|--version|-V) cmd_version ;;
     ip)              cmd_ip ;;
     login|signin)    shift; cmd_login "$@" ;;
