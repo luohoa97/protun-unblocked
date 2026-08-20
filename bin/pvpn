@@ -66,6 +66,15 @@ SETTINGS="$HOME/.config/Proton/VPN/settings.json"
 # flags. Kept separate from Proton's settings.json because that file belongs
 # to their client and gets rewritten by it.
 PVPN_CONF="${PVPN_CONF:-$HOME/.config/pvpn/config}"
+
+# What you last asked for. pvpnd reads this and ONLY ever acts to satisfy
+# it, so `pvpn down` stays down - a daemon that reconnects two seconds after
+# you disconnect is worse than no daemon at all.
+PVPN_INTENT="${PVPN_INTENT_FILE:-$HOME/.config/pvpn/intent}"
+set_intent() {
+    mkdir -p "$(dirname "$PVPN_INTENT")" 2>/dev/null || return 0
+    printf '%s\n' "$1" > "$PVPN_INTENT" 2>/dev/null || true
+}
 # shellcheck source=/dev/null
 [[ -r "$PVPN_CONF" ]] && source "$PVPN_CONF"
 
@@ -654,18 +663,9 @@ steer_env() {
 #
 # Delegating means every flag `up` grows works here for free, and the two
 # can never disagree again.
-cmd_hop() {
-    local current
-    current="$(current_server)"
-    if [[ -z "$current" ]]; then
-        warn "Not connected - connecting instead."
-        cmd_up "$@"
-        return $?
-    fi
-    say "Currently on: $current"
-    # status prints "NAME in City, Country"; the ranking holds only NAME.
-    cmd_up --not "${current%% in *}" "$@"
-}
+# `hop` is `up --hop`. Kept because it is a natural verb and shorter to
+# type, but it is an alias, not an implementation - so it cannot drift.
+cmd_hop() { cmd_up --hop "$@"; }
 
 # Rank servers by measured latency, in parallel.
 #
@@ -844,6 +844,8 @@ pvpn up - connect, picking the best server it can reach
       --city NAME       tokyo, amsterdam ...            (repeatable)
   -s, --server NAME     JP-FREE#5                       (repeatable)
   -p, --protocol NAME   protun-tls (Stealth), wireguard, openvpn-tcp ...
+      --hop             connect somewhere OTHER than the current server
+      --not SERVER      exclude a specific server (repeatable)
       --prefer WHICH    latency | load | balanced   (default balanced)
       --latency         short for --prefer latency
       --load            short for --prefer load
@@ -876,7 +878,7 @@ EOF
 }
 
 cmd_up() {
-    local proto="" filter="" force=0 skip_scan=0 verify=0
+    local proto="" filter="" force=0 skip_scan=0 verify=0 hop_away=0
     local -a exclude=()
 
     while [[ $# -gt 0 ]]; do
@@ -886,6 +888,8 @@ cmd_up() {
             -s|--server)   filter="${filter:+$filter,}${2:?--server needs a value}";  shift 2 ;;
             -p|--protocol) proto="${2:?--protocol needs a value}";                    shift 2 ;;
             --not)         exclude+=("${2:?--not needs a server name}"); shift 2 ;;
+            # "anywhere but here". `hop` is just this with a shorter name.
+            --hop|--switch) hop_away=1; shift ;;
             --prefer)      PREFER="${2:?--prefer needs latency|load|balanced}"; shift 2 ;;
             --latency)     PREFER=latency; shift ;;
             --load)        PREFER=load; shift ;;
@@ -916,6 +920,19 @@ cmd_up() {
 
     [[ "${PVPN_NO_SCAN:-0}" == 1 ]] && skip_scan=1
     [[ "${PVPN_VERIFY:-0}" == 1 ]] && verify=1
+
+    # --hop means "not the one I am on". Resolved here rather than by the
+    # caller so `up --hop` and `hop` cannot behave differently.
+    if (( hop_away )); then
+        local here; here="$(current_server)"
+        if [[ -n "$here" ]]; then
+            say "Currently on: $here"
+            # status prints "NAME in City, Country"; rankings hold only NAME.
+            exclude+=("${here%% in *}")
+        else
+            warn "Not connected - --hop has nothing to move away from."
+        fi
+    fi
     # Deliberately NOT need_tor here. Connecting goes straight to Proton's
     # server IP and works with Tor stopped. Tor is only required if the
     # cached server list has gone stale, and ensure_fresh_data checks it
@@ -924,16 +941,30 @@ cmd_up() {
     need_shim
 
     if is_connected; then
-        if net_works; then
+        # "Already connected" is the right answer to `pvpn up`, and the WRONG
+        # answer to `pvpn up --hop` or `--not X` - those mean "move me", so
+        # returning early made --hop silently do nothing on a healthy tunnel.
+        #
+        # Switching does NOT need a separate `pvpn down` first: `protonvpn
+        # connect` replaces the active tunnel in place. Tearing it down first
+        # would drop you to the bare network in between, which is both slower
+        # and a moment of unprotected traffic.
+        if (( hop_away || ${#exclude[@]} )); then
+            say "Switching server without disconnecting first."
+        elif net_works; then
             ok "Already connected."; cmd_status; return 0
         fi
         # Claims connected but nothing passes - the post-resume case. Tear
         # it down and rebuild rather than reporting a working VPN.
+        if (( hop_away || ${#exclude[@]} )); then
+            :   # deliberate switch, not a fault - leave the tunnel up
+        else
         warn "Connected, but no traffic is passing - stale tunnel."
         note "common after suspend: protun's reconnect probes UDP, which this"
         note "network blocks, so it cannot recover on its own. Rebuilding..."
         restore >/dev/null 2>&1
         sleep 2
+        fi
     fi
 
     # Primary default is Stealth. Explicit args still win when available.
@@ -942,6 +973,8 @@ cmd_up() {
     elif protocol_available "protun-tls"; then
         set_protocol "protun-tls"
     fi
+    set_intent up
+
     # Deliberately do NOT seed this from settings.json.
     #
     # The right protocol is a property of the NETWORK, not a preference.
@@ -1130,6 +1163,10 @@ cmd_up() {
 }
 
 cmd_down() {
+    # Record this FIRST. If the disconnect is slow, pvpnd must already know
+    # you meant it - otherwise it sees a dying tunnel, assumes a fault, and
+    # reconnects you.
+    set_intent down
     pv disconnect >/dev/null 2>&1
     if restore; then ok "Disconnected. Internet is working."
     else warn "Disconnected, but the network looks down. Try: nmcli con up detnsw"; fi
@@ -1445,7 +1482,7 @@ pvpn - simple Proton VPN control
                              --any      skip ranking
                              --verify   confirm traffic (slow, off by default)
                        see: pvpn up --help
-  pvpn hop [flags]     switch to a different server - same flags as `up`
+  pvpn hop [flags]     alias for `pvpn up --hop`
   pvpn scan [match]    rank servers by measured latency (probes in parallel)
   pvpn best [match]    scan, then connect to the fastest
   pvpn down            disconnect and restore normal internet

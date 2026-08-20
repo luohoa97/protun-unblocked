@@ -1,0 +1,23 @@
+[Unit]
+Description=Keep the Proton VPN tunnel alive (pvpn)
+Documentation=https://github.com/luohoa97/protun-unblocked
+# Not After=network-online.target: this must survive the network going away
+# and coming back, which is the whole point. It handles being offline.
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/pvpnd
+Restart=always
+RestartSec=10
+# It shells out to pvpn, which drives NetworkManager over D-Bus as YOU.
+# Running as the user is required, not merely preferred: Proton keeps
+# per-user state (keyring, settings.json) that root cannot see.
+Slice=session.slice
+# Modest hardening. No NoNewPrivileges: pvpn may call sudo to remove a
+# stray kill-switch device.
+PrivateTmp=false
+ProtectHome=false
+
+[Install]
+WantedBy=default.target
