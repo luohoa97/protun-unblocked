@@ -644,76 +644,27 @@ steer_env() {
 #   pvpn hop tokyo       by city
 #   pvpn hop JP,SG       several, OR-ed
 #   pvpn hop SG-FREE#12  one exact server
+# `hop` is `up` with the server you are on excluded.
+#
+# It used to be its own implementation, and that was the bug: it called the
+# scanner with --names, which does no probing, then steered to EVERY match
+# and let Proton choose. So it could not pick the fastest, and it silently
+# lacked --fastest, --prefer, -p and --verify because each had been added to
+# `up` alone. Two parsers for one idea, drifting apart.
+#
+# Delegating means every flag `up` grows works here for free, and the two
+# can never disagree again.
 cmd_hop() {
-    need_shim
-    local want="" before after rc
-    # Same flags as `up`, so there is one vocabulary to learn.
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -c|--country|--city|-s|--server)
-                want="${want:+$want,}${2:?$1 needs a value}"; shift 2 ;;
-            -h|--help)
-                say "pvpn hop [-c COUNTRY] [--city CITY] [-s SERVER]"
-                say "  no filter: any server other than the current one"
-                return 0 ;;
-            -*) err "Unknown flag: $1"; return 1 ;;
-            *)  want="${want:+$want,}$1"; shift ;;
-        esac
-    done
-    local steer=()
-
-    before="$(current_server)"
-    [[ -n "$before" ]] && say "Currently on: $before"
-
-    if [[ -n "$want" ]]; then
-        # Resolve the filter to concrete names with the shared matcher, so
-        # `hop japan` and `scan japan` can never disagree.
-        local names
-        names="$(/usr/bin/python3 "$SCAN" "$want" --names 2>/dev/null | paste -sd, -)"
-        if [[ -z "$names" ]]; then
-            err "No free server matches '${want}'."
-            say "  try: pvpn scan   (to see what exists)"
-            return 1
-        fi
-        say "Target: servers matching '${want}'"
-        steer=(env "PVPN_ONLY=$names")
-    else
-        [[ -n "$before" ]] || { warn "Not connected - just connecting."; cmd_up; return $?; }
-        # status prints "NAME in City, Country"; the list holds only NAME.
-        steer=(env "PVPN_EXCLUDE=${before%% in *}")
+    local current
+    current="$(current_server)"
+    if [[ -z "$current" ]]; then
+        warn "Not connected - connecting instead."
+        cmd_up "$@"
+        return $?
     fi
-
-    trap 'echo; warn "Interrupted - restoring..."; restore; exit 130' INT TERM
-
-    pv disconnect >/dev/null 2>&1
-    sleep 2
-    rc=0
-    timeout "$CONNECT_TIMEOUT" "${steer[@]}" "${PV_DIRECT[@]}" connect >"$LOG" 2>&1 || rc=$?
-    if (( rc != 0 )) || ! is_connected; then
-        err "Hop failed to connect."
-        grep -iE 'error|failed|not available' "$LOG" | tail -2
-        trap on_exit EXIT INT TERM
-        warn "Restoring your normal connection..."
-        restore && ok "Internet restored." || err "Still down - try: pvpn down"
-        return 1
-    fi
-
-    after="$(current_server)"
-    say "  landed on ${after} - checking traffic..."
-    if net_works_settled; then
-        trap on_exit EXIT INT TERM
-        ok "Hopped${before:+: ${before%% in *} ->} ${after}"
-        cmd_ip
-        refresh_after_connect
-        return 0
-    fi
-
-    trap on_exit EXIT INT TERM
-    warn "${after} has not passed traffic yet after ${PVPN_SETTLE:-90}s."
-    warn "Keeping it - slow starts are normal here and it may come good."
-    say  "  check with:  pvpn status   |   move on with:  pvpn hop   |   stop:  pvpn down"
-    cmd_ip
-    return 0
+    say "Currently on: $current"
+    # status prints "NAME in City, Country"; the ranking holds only NAME.
+    cmd_up --not "${current%% in *}" "$@"
 }
 
 # Rank servers by measured latency, in parallel.
@@ -926,6 +877,7 @@ EOF
 
 cmd_up() {
     local proto="" filter="" force=0 skip_scan=0 verify=0
+    local -a exclude=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -933,6 +885,7 @@ cmd_up() {
             --city)        filter="${filter:+$filter,}${2:?--city needs a value}";    shift 2 ;;
             -s|--server)   filter="${filter:+$filter,}${2:?--server needs a value}";  shift 2 ;;
             -p|--protocol) proto="${2:?--protocol needs a value}";                    shift 2 ;;
+            --not)         exclude+=("${2:?--not needs a server name}"); shift 2 ;;
             --prefer)      PREFER="${2:?--prefer needs latency|load|balanced}"; shift 2 ;;
             --latency)     PREFER=latency; shift ;;
             --load)        PREFER=load; shift ;;
@@ -1052,10 +1005,29 @@ cmd_up() {
     local -a TARGETS=()
     if (( ! skip_scan )) && [[ -f "$SCAN" ]]; then
         mapfile -t TARGETS < <(ranked_servers "$filter" "$force")
+
+        # Drop anything --not asked us to avoid. This is how `hop` works:
+        # it is `up` with the current server excluded, so it inherits the
+        # ranking - and every other flag - instead of reimplementing them.
+        if (( ${#exclude[@]} && ${#TARGETS[@]} )); then
+            local -a kept=() t x skip
+            for t in "${TARGETS[@]}"; do
+                skip=0
+                for x in "${exclude[@]}"; do
+                    [[ "$t" == "$x" ]] && { skip=1; break; }
+                done
+                (( skip )) || kept+=("$t")
+            done
+            TARGETS=("${kept[@]}")
+        fi
+
         if (( ${#TARGETS[@]} )); then
             ok "Best pick: ${TARGETS[0]}${filter:+  (matching '$filter')}"
         elif [[ -n "$filter" ]]; then
             err "Nothing matched '$filter'. Try:  pvpn scan"
+            return 1
+        elif (( ${#exclude[@]} )); then
+            err "No other server available to move to."
             return 1
         fi
     fi
@@ -1473,7 +1445,7 @@ pvpn - simple Proton VPN control
                              --any      skip ranking
                              --verify   confirm traffic (slow, off by default)
                        see: pvpn up --help
-  pvpn hop [match]     switch server; optionally one matching e.g. JP, SG-FREE#12
+  pvpn hop [flags]     switch to a different server - same flags as `up`
   pvpn scan [match]    rank servers by measured latency (probes in parallel)
   pvpn best [match]    scan, then connect to the fastest
   pvpn down            disconnect and restore normal internet
