@@ -215,28 +215,36 @@ say what you want:
 | Tunnel actually breaks | Reconnects, as before |
 
 The last two are the hard part, because "you turned it off" and "it broke"
-look identical to anything that only checks whether traffic flows. They are
-told apart by *how* the tunnel went away:
+look identical to anything that only checks whether traffic flows. pvpnd
+subscribes to NetworkManager's **D-Bus signals**, so it is told the exact
+transition and NetworkManager's own reason code:
 
-- **Still `activated` in NetworkManager, but no packets** — that is the
-  failure this daemon exists for (`boringtun HANDSHAKE(REKEY_TIMEOUT)`; see
-  Why this exists). Reconnect.
-- **Gone from NetworkManager entirely** — something took it down. Ask
-  NetworkManager's journal why: `reason 'user-requested'` means you did.
+| NM reason | Meaning |
+| --- | --- |
+| `USER_DISCONNECTED` (2) | you did it — stand down |
+| `CONNECTION_REMOVED` (11) | profile deleted — stand down |
+| `LOGIN_FAILED` (10), timeouts, anything else | a fault — reconnect |
 
-If NetworkManager doesn't say why, connectivity decides: internet working
-without a tunnel means you chose to be VPN-less, so pvpn stands down; no
-internet at all means the *network* died, so intent is kept and pvpn waits.
-Turning your wifi off does not silently disarm autoreconnect.
+**This has to be signals, not polling, and the first version got it wrong.**
+Polling samples *state*, and state cannot distinguish "this tunnel is here"
+from "this tunnel is 30ms from being gone". A poll landed in the gap between
+`pvpn down` writing `intent=down` and NetworkManager finishing the teardown,
+saw a live tunnel with `intent=down`, concluded you must have switched it on
+from GNOME, and adopted it back to `intent=up`. Autoreconnect did the rest,
+and **the VPN would not stay off**. A signal carries the transition *and* the
+reason, so that gap does not exist and nothing has to be inferred.
 
 While `pvpn` is mid-connect it drops a marker at
-`$XDG_RUNTIME_DIR/pvpn.busy`, because NetworkManager honestly shows no VPN
-for a few seconds during a connect — without it the daemon would read your
-own `pvpn up` as you switching the VPN off. The marker expires after two
-minutes, so a crashed `pvpn` can't mute the daemon permanently.
+`$XDG_RUNTIME_DIR/pvpn.busy`. `pvpn hop` legitimately produces a deliberate
+disconnect followed by an activate, and acting on the first half would leave
+you disconnected if the second half failed. pvpn writes intent itself for its
+own commands, so ignoring its signals loses nothing. The marker expires after
+two minutes, so a crashed `pvpn` can't mute the daemon permanently.
 
-Polling, not D-Bus signals: subscribing to NetworkManager's signals on the
-system bus requires root, and `pvpnd` deliberately runs as you.
+Receiving NM's broadcast signals needs **no root** — verified on this
+machine, contrary to what `gdbus monitor` implies when
+`DBUS_SYSTEM_BUS_ADDRESS` is unset (it reports "No such file or directory",
+which reads like a permissions problem and is not one). `pvpnd` runs as you.
 
 ## Picking a fast server
 

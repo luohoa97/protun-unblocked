@@ -47,18 +47,31 @@
 //! `pvpn` records INTENT, and this only ever acts to satisfy it.
 //!
 //! That has to hold for the GNOME quick-settings VPN switch too, which does
-//! not know pvpn exists - it talks to NetworkManager directly. Without the
-//! NM polling below, flicking that switch off produced a standoff: NM tears
-//! the tunnel down, pvpnd still reads intent=up, and puts it straight back.
-//! So NM is treated as a second place you can express intent, and toggling
-//! the VPN there means exactly what `pvpn up` / `pvpn down` mean.
+//! not know pvpn exists - it talks to NetworkManager directly. So NM is
+//! treated as a second place you can express intent, and toggling the VPN
+//! there means exactly what `pvpn up` / `pvpn down` mean.
+//!
+//! This is done with D-Bus SIGNALS, and the first attempt at it - polling
+//! NM's connection list - is worth recording, because it broke `pvpn down`.
+//! Polling samples STATE, and state cannot distinguish "this tunnel is
+//! here" from "this tunnel is thirty milliseconds from being gone". A poll
+//! landed in the gap between `pvpn down` writing intent=down and NM
+//! finishing the teardown, saw a live tunnel with intent=down, concluded
+//! the user must have switched it on from GNOME, and adopted it back to
+//! intent=up. Autoreconnect then did the rest, and the VPN would not stay
+//! off.
+//!
+//! A signal carries the TRANSITION and NM's own reason code
+//! (USER_DISCONNECTED vs a fault), so that gap does not exist and nothing
+//! has to be inferred.
 
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROBE_HOST: &str = "connectivitycheck.gstatic.com";
@@ -194,11 +207,11 @@ fn pvpn_is_busy() -> bool {
 /// The VPN as NetworkManager sees it, which is what GNOME's switch drives.
 /// Returns the connection name, or None when no VPN is up.
 ///
-/// Polled rather than subscribed to on purpose: watching signals on the
-/// system bus needs root (`gdbus monitor --system` is refused for a user
-/// session), and pvpnd deliberately runs as you, not as root. One nmcli
-/// call per tick is the price. It replaces the old `pvpn status` call,
-/// which spawned the whole Python client to answer the same question.
+/// Used only to answer "is a tunnel up right now" for the health loop and
+/// the state file - NEVER to decide what the user wants. That decision is
+/// made from signals; see spawn_nm_watcher for why sampling cannot make it
+/// correctly. It replaces the old `pvpn status` call, which spawned the
+/// whole Python client to answer the same question.
 ///
 /// Any active vpn/wireguard profile counts, not just ones named "ProtonVPN":
 /// hopping leaves profiles named after bare server IPs.
@@ -222,56 +235,123 @@ fn nm_vpn_connection() -> Option<String> {
     None
 }
 
-/// Why did the VPN go away?
+/// Something happened to the VPN, as reported by NetworkManager itself.
 #[derive(PartialEq, Debug, Clone, Copy)]
-enum Reason {
-    /// Somebody asked for it: the GNOME switch, nmcli, pvpn down.
-    Deliberate,
-    /// It fell over.
-    Failure,
-    Unknown,
+enum Ev {
+    /// A tunnel finished activating.
+    Activated,
+    /// It went away because somebody asked: GNOME's switch, nmcli, pvpn down.
+    WentDownDeliberately,
+    /// It went away on its own.
+    Failed,
 }
 
-/// Ask NetworkManager's journal why the tunnel went down.
+/// D-Bus reason codes, from NetworkManager's own enums
+/// (NMActiveConnectionStateReason / NMVpnConnectionStateReason). Only the two
+/// that mean "a human asked for this" matter; everything else is a fault.
+const REASON_USER_DISCONNECTED: u32 = 2;
+const REASON_CONNECTION_REMOVED: u32 = 11;
+
+/// Pull `(state, reason)` out of a gdbus signal line.
 ///
-/// This is the entire difference between "you turned it off" and "it broke",
-/// and getting it wrong is bad in both directions - reconnecting after you
-/// deliberately toggled the switch is the behaviour that makes a daemon
-/// hateful, and standing down after a fault defeats the point of having one.
-///
-/// NM writes the answer in its state-change lines:
-///     device (proton0): state change: ... (reason 'user-requested' ...
-/// Matched as plain substrings, so if NM ever rewords these we degrade to
-/// Unknown - which the caller resolves by other means - rather than
-/// confidently misreading them.
-fn nm_disconnect_reason() -> Reason {
-    let out = Command::new("journalctl")
-        .args(["-u", "NetworkManager", "--since", "-120s", "--no-pager", "-o", "cat"])
-        .stderr(Stdio::null())
-        .output();
-    let out = match out {
-        Ok(o) => o,
-        Err(_) => return Reason::Unknown,
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    // Last verdict wins: we want the most recent transition, not the first.
-    let mut verdict = Reason::Unknown;
-    for line in text.lines() {
-        if !line.contains("state change:") {
-            continue;
-        }
-        if line.contains("reason 'user-requested'") || line.contains("reason 'connection-removed'")
-        {
-            verdict = Reason::Deliberate;
-        } else if line.contains("reason 'login-failed'")
-            || line.contains("reason 'no-secrets'")
-            || line.contains("reason 'service-start-failed'")
-            || line.contains("-> failed")
-        {
-            verdict = Reason::Failure;
+/// The line looks like:
+///     /org/.../ActiveConnection/12: org...VpnStateChanged (uint32 7, uint32 2)
+/// Parsed by splitting on literal markers rather than by pattern matching, so
+/// a wording change produces None - and None is inert - instead of a
+/// confident misread.
+fn parse_state_reason(line: &str, marker: &str) -> Option<(u32, u32)> {
+    let rest = line.split_once(marker)?.1;
+    let mut nums: Vec<u32> = Vec::new();
+    for chunk in rest.split("uint32 ").skip(1) {
+        let digits: String = chunk.chars().take_while(|c| c.is_ascii_digit()).collect();
+        nums.push(digits.parse().ok()?);
+        if nums.len() == 2 {
+            return Some((nums[0], nums[1]));
         }
     }
-    verdict
+    None
+}
+
+/// Turn one line of gdbus output into an event, if it is one we care about.
+///
+/// Two interfaces, because NetworkManager models the two tunnel kinds
+/// differently and they do NOT share a state enum:
+///
+///   VPN.Connection.VpnStateChanged      protun / OpenVPN.  5=ACTIVATED,
+///                                       6=FAILED, 7=DISCONNECTED
+///   Connection.Active.StateChanged      WireGuard.         2=ACTIVATED,
+///                                       4=DEACTIVATED
+fn line_to_event(line: &str) -> Option<Ev> {
+    let (activated, gone, (state, reason)) =
+        if line.contains(".VPN.Connection.VpnStateChanged") {
+            (5u32, [6u32, 7u32], parse_state_reason(line, "VpnStateChanged")?)
+        } else if line.contains(".Connection.Active.StateChanged") {
+            (2u32, [4u32, 4u32], parse_state_reason(line, "StateChanged")?)
+        } else {
+            return None;
+        };
+
+    if state == activated {
+        return Some(Ev::Activated);
+    }
+    if gone.contains(&state) {
+        // THE line that fixes `pvpn down`. NM says outright whether a human
+        // asked for this, so there is no window to sample wrongly and no
+        // guessing from whether the internet happens to work.
+        return Some(if reason == REASON_USER_DISCONNECTED || reason == REASON_CONNECTION_REMOVED {
+            Ev::WentDownDeliberately
+        } else {
+            Ev::Failed
+        });
+    }
+    None
+}
+
+/// Watch NetworkManager's D-Bus signals forever, forwarding events.
+///
+/// Signals, not polling, and that distinction is the whole point. Polling
+/// samples STATE, so it cannot tell "this tunnel is on its way out" from
+/// "this tunnel is here" - which is exactly how `pvpn down` broke: the poll
+/// landed in the gap between intent being written and NM finishing the
+/// teardown, saw a live tunnel with intent=down, and adopted it back.
+/// A signal carries the TRANSITION and its REASON, so that gap does not
+/// exist.
+///
+/// Unprivileged: receiving NM's broadcast signals needs no root, verified on
+/// this machine. DBUS_SYSTEM_BUS_ADDRESS has to be set by hand because a
+/// systemd *user* service does not inherit it.
+fn spawn_nm_watcher(tx: Sender<Ev>) {
+    std::thread::spawn(move || loop {
+        let child = Command::new("gdbus")
+            .args(["monitor", "--system", "--dest", "org.freedesktop.NetworkManager"])
+            .env(
+                "DBUS_SYSTEM_BUS_ADDRESS",
+                std::env::var("DBUS_SYSTEM_BUS_ADDRESS")
+                    .unwrap_or_else(|_| "unix:path=/run/dbus/system_bus_socket".into()),
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+
+        match child {
+            Ok(mut c) => {
+                if let Some(out) = c.stdout.take() {
+                    for line in BufReader::new(out).lines().map_while(Result::ok) {
+                        if let Some(ev) = line_to_event(&line) {
+                            if tx.send(ev).is_err() {
+                                return; // main loop is gone
+                            }
+                        }
+                    }
+                }
+                let _ = c.wait();
+                log("nm watcher: gdbus exited, restarting in 5s");
+            }
+            Err(e) => log(&format!("nm watcher: cannot start gdbus ({e}), retrying in 5s")),
+        }
+        // NM restarting takes its monitor down with it; never spin on it.
+        std::thread::sleep(Duration::from_secs(5));
+    });
 }
 
 fn now_secs() -> u64 {
@@ -362,6 +442,72 @@ fn reconnect() -> bool {
     ok
 }
 
+/// Apply one NetworkManager event to our idea of what you want.
+fn handle_event(ev: Ev, strikes: &mut usize, backoff: &mut Duration) {
+    // While pvpn is mid-operation its own signals are noise: `pvpn hop`
+    // legitimately emits a deliberate down followed by an activate, and
+    // acting on the down half would leave intent=down if the up half then
+    // failed - quietly turning a failed hop into a permanent disconnect.
+    // pvpn writes intent itself for these, so nothing is lost by ignoring
+    // them.
+    if pvpn_is_busy() {
+        return;
+    }
+    match ev {
+        Ev::Activated => {
+            if read_intent() != Intent::Up {
+                log("VPN switched on outside pvpn - adopting (intent=up)");
+                write_intent(Intent::Up);
+            }
+            *strikes = 0;
+            *backoff = Duration::from_secs(0);
+        }
+        Ev::WentDownDeliberately => {
+            if read_intent() != Intent::Down {
+                log("VPN switched off outside pvpn - standing down (intent=down)");
+                write_intent(Intent::Down);
+            }
+            *strikes = 0;
+            *backoff = Duration::from_secs(0);
+        }
+        // A fault does not change what you asked for, so intent is left
+        // alone and the health loop handles it with strikes and backoff.
+        Ev::Failed => log("NetworkManager reports the tunnel failed"),
+    }
+}
+
+/// Wait for the next tick, but wake the moment NetworkManager says
+/// something. This is what makes the GNOME switch feel instant instead of
+/// taking up to `interval` seconds to register.
+fn wait(rx: &Receiver<Ev>, d: Duration, strikes: &mut usize, backoff: &mut Duration) {
+    let deadline = Instant::now() + d;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match rx.recv_timeout(left) {
+            Ok(ev) => {
+                handle_event(ev, strikes, backoff);
+                for extra in rx.try_iter() {
+                    handle_event(extra, strikes, backoff);
+                }
+                // Re-evaluate now rather than sitting out the rest of the
+                // tick - but not instantly, or a connect's burst of signals
+                // would spin the loop.
+                std::thread::sleep(Duration::from_secs(1));
+                return;
+            }
+            Err(RecvTimeoutError::Timeout) => return,
+            Err(RecvTimeoutError::Disconnected) => {
+                // Watcher thread is gone; degrade to a plain timer.
+                std::thread::sleep(left);
+                return;
+            }
+        }
+    }
+}
+
 fn main() {
     let interval = Duration::from_secs(config_num("watch_interval", 20).clamp(5, 600));
     let probe_timeout = Duration::from_secs(config_num("probe_timeout", 5).clamp(1, 30));
@@ -386,70 +532,35 @@ fn main() {
     let mut last_attempt: Option<Instant> = None;
     let mut recent: VecDeque<bool> = VecDeque::with_capacity(8);
 
-    loop {
-        let intent = read_intent();
-        // NetworkManager, not the Proton client, is the source of truth for
-        // "is there a tunnel": it is what GNOME's switch acts on, and it is
-        // one cheap call instead of spawning the whole Python client.
-        let nm_vpn = nm_vpn_connection();
-        let connected = nm_vpn.is_some();
+    let (tx, rx) = channel::<Ev>();
+    spawn_nm_watcher(tx);
 
+    loop {
         // --- NetworkManager as a second place you can express intent -----
         //
-        // Skipped while pvpn is mid-operation. During a connect NM honestly
-        // shows no VPN for a few seconds, and reading that as "they turned
-        // it off in GNOME" would make pvpnd abandon your own `pvpn up`.
-        if !pvpn_is_busy() {
-            if intent != Intent::Up && connected {
-                // Switched on from outside - the GNOME menu, or nmcli.
-                // Adopt it, so status, the GUI and the daemon agree, and so
-                // it gets kept alive like any tunnel pvpn started itself.
-                log(&format!(
-                    "VPN switched on outside pvpn ({}) - adopting, intent=up",
-                    nm_vpn.as_deref().unwrap_or("?")
-                ));
-                write_intent(Intent::Up);
-                write_state(true, true, Intent::Up, "adopted a VPN started outside pvpn");
-                strikes = 0;
-                backoff = Duration::from_secs(0);
-                std::thread::sleep(interval);
-                continue;
-            }
-
-            if intent == Intent::Up && !connected {
-                // Gone from NM entirely. That is NOT what a broken tunnel
-                // looks like here: the failure this daemon exists for
-                // leaves proton0 "activated" and merely stops passing
-                // packets. A vanished connection means something took it
-                // down - so find out whether that something was you.
-                let deliberate = match nm_disconnect_reason() {
-                    Reason::Deliberate => true,
-                    Reason::Failure => false,
-                    // NM did not say. If the internet works without the
-                    // tunnel then you are online and VPN-less, which is
-                    // what the switch being off looks like. If it does not,
-                    // the network itself went away - keep intent and wait,
-                    // or turning off the wifi would silently disarm pvpnd.
-                    Reason::Unknown => traffic_flows(probe_timeout),
-                };
-                if deliberate {
-                    log("VPN switched off outside pvpn - standing down (intent=down)");
-                    write_intent(Intent::Down);
-                    write_state(false, false, Intent::Down, "switched off outside pvpn");
-                    strikes = 0;
-                    backoff = Duration::from_secs(0);
-                    std::thread::sleep(interval);
-                    continue;
-                }
-            }
+        // Driven by signals, never by sampling. Each event is a TRANSITION
+        // NM actually performed, with NM's own reason code attached, so
+        // there is no window in which a tunnel that is on its way out looks
+        // like a tunnel that is present.
+        //
+        // pvpn's own commands land here too, and that is fine: `pvpn down`
+        // produces USER_DISCONNECTED, which means exactly what pvpn already
+        // wrote. The CLI and the GNOME switch stop being different cases.
+        for ev in rx.try_iter() {
+            handle_event(ev, &mut strikes, &mut backoff);
         }
+
+        let intent = read_intent();
+        // NM, not the Proton client, answers "is there a tunnel": it is one
+        // cheap call instead of spawning the whole Python client.
+        let connected = nm_vpn_connection().is_some();
 
         // Nothing to maintain unless the user asked to be up.
         if intent != Intent::Up {
             strikes = 0;
             backoff = Duration::from_secs(0);
             write_state(connected, connected, intent, "idle: intent is not up");
-            std::thread::sleep(interval);
+            wait(&rx, interval, &mut strikes, &mut backoff);
             continue;
         }
 
@@ -483,7 +594,7 @@ fn main() {
 
             if !enabled {
                 // Still report it; just do not act.
-                std::thread::sleep(interval);
+                wait(&rx, interval, &mut strikes, &mut backoff);
                 continue;
             }
 
@@ -511,6 +622,84 @@ fn main() {
             }
         }
 
-        std::thread::sleep(interval);
+        wait(&rx, interval, &mut strikes, &mut backoff);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real gdbus lines. The reason codes are what make `pvpn down` work, so
+    /// they are pinned here: a change in this table is a change in whether
+    /// the daemon fights the user.
+    #[test]
+    fn signal_lines_map_to_the_right_events() {
+        let vpn = "/org/freedesktop/NetworkManager/ActiveConnection/12: \
+                   org.freedesktop.NetworkManager.VPN.Connection.VpnStateChanged";
+        let act = "/org/freedesktop/NetworkManager/ActiveConnection/9: \
+                   org.freedesktop.NetworkManager.Connection.Active.StateChanged";
+
+        // GNOME switch off / pvpn down: DISCONNECTED + USER_DISCONNECTED.
+        assert_eq!(
+            line_to_event(&format!("{vpn} (uint32 7, uint32 2)")),
+            Some(Ev::WentDownDeliberately)
+        );
+        // Profile deleted, as `pvpn hop` does: CONNECTION_REMOVED.
+        assert_eq!(
+            line_to_event(&format!("{vpn} (uint32 7, uint32 11)")),
+            Some(Ev::WentDownDeliberately)
+        );
+        // LOGIN_FAILED is a fault - standing down here would disable
+        // autoreconnect exactly when it is needed.
+        assert_eq!(
+            line_to_event(&format!("{vpn} (uint32 6, uint32 10)")),
+            Some(Ev::Failed)
+        );
+        assert_eq!(
+            line_to_event(&format!("{vpn} (uint32 5, uint32 1)")),
+            Some(Ev::Activated)
+        );
+
+        // WireGuard reports on a different interface with a different enum:
+        // 2 = ACTIVATED, 4 = DEACTIVATED.
+        assert_eq!(
+            line_to_event(&format!("{act} (uint32 2, uint32 1)")),
+            Some(Ev::Activated)
+        );
+        assert_eq!(
+            line_to_event(&format!("{act} (uint32 4, uint32 2)")),
+            Some(Ev::WentDownDeliberately)
+        );
+    }
+
+    /// Anything we do not positively recognise must be inert. A daemon that
+    /// guesses from half-understood input is how the polling version broke.
+    #[test]
+    fn unrecognised_lines_are_inert() {
+        let vpn = "/org/freedesktop/NetworkManager/ActiveConnection/12: \
+                   org.freedesktop.NetworkManager.VPN.Connection.VpnStateChanged";
+        // Mid-transition states are not decisions.
+        assert_eq!(line_to_event(&format!("{vpn} (uint32 3, uint32 1)")), None);
+        // Unrelated NM chatter.
+        assert_eq!(
+            line_to_event(
+                "/org/freedesktop/NetworkManager/AccessPoint/13177: \
+                 org.freedesktop.DBus.Properties.PropertiesChanged ('x',)"
+            ),
+            None
+        );
+        // Malformed payload must yield None, never a misparse.
+        assert_eq!(line_to_event(&format!("{vpn} (garbage)")), None);
+        assert_eq!(line_to_event(&format!("{vpn} (uint32 7)")), None);
+        assert_eq!(line_to_event(""), None);
+    }
+
+    #[test]
+    fn parses_both_numbers_not_just_the_first() {
+        assert_eq!(
+            parse_state_reason("x VpnStateChanged (uint32 7, uint32 11)", "VpnStateChanged"),
+            Some((7, 11))
+        );
     }
 }
