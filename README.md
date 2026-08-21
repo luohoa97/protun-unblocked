@@ -198,6 +198,46 @@ before you spend time on the client.
   with a shim that forces aiohttp onto its threaded resolver — torsocks cannot
   proxy the UDP that `aiodns` uses, so lookups fail without it.
 
+## The GNOME VPN switch works too
+
+GNOME's quick-settings VPN toggle talks to NetworkManager, not to pvpn — so
+before, the two could deadlock. You flick the switch off, NetworkManager
+tears the tunnel down, `pvpnd` still reads `intent=up`, and puts it straight
+back. The switch appeared broken.
+
+`pvpnd` now watches NetworkManager and treats it as a second place you can
+say what you want:
+
+| You do this | pvpn does this |
+| --- | --- |
+| Switch the VPN **on** in GNOME | Adopts it — `intent=up`, keeps it alive like any tunnel it started |
+| Switch it **off** in GNOME | Stands down — `intent=down`, no reconnect |
+| Tunnel actually breaks | Reconnects, as before |
+
+The last two are the hard part, because "you turned it off" and "it broke"
+look identical to anything that only checks whether traffic flows. They are
+told apart by *how* the tunnel went away:
+
+- **Still `activated` in NetworkManager, but no packets** — that is the
+  failure this daemon exists for (`boringtun HANDSHAKE(REKEY_TIMEOUT)`; see
+  Why this exists). Reconnect.
+- **Gone from NetworkManager entirely** — something took it down. Ask
+  NetworkManager's journal why: `reason 'user-requested'` means you did.
+
+If NetworkManager doesn't say why, connectivity decides: internet working
+without a tunnel means you chose to be VPN-less, so pvpn stands down; no
+internet at all means the *network* died, so intent is kept and pvpn waits.
+Turning your wifi off does not silently disarm autoreconnect.
+
+While `pvpn` is mid-connect it drops a marker at
+`$XDG_RUNTIME_DIR/pvpn.busy`, because NetworkManager honestly shows no VPN
+for a few seconds during a connect — without it the daemon would read your
+own `pvpn up` as you switching the VPN off. The marker expires after two
+minutes, so a crashed `pvpn` can't mute the daemon permanently.
+
+Polling, not D-Bus signals: subscribing to NetworkManager's signals on the
+system bus requires root, and `pvpnd` deliberately runs as you.
+
 ## Picking a fast server
 
 ```bash

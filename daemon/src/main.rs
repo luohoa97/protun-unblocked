@@ -45,6 +45,13 @@
 //! Fight you. If you run `pvpn down`, that is an instruction, not a fault -
 //! a daemon that reconnects two seconds later is worse than no daemon. So
 //! `pvpn` records INTENT, and this only ever acts to satisfy it.
+//!
+//! That has to hold for the GNOME quick-settings VPN switch too, which does
+//! not know pvpn exists - it talks to NetworkManager directly. Without the
+//! NM polling below, flicking that switch off produced a standoff: NM tears
+//! the tunnel down, pvpnd still reads intent=up, and puts it straight back.
+//! So NM is treated as a second place you can express intent, and toggling
+//! the VPN there means exactly what `pvpn up` / `pvpn down` mean.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -69,6 +76,13 @@ fn state_path() -> PathBuf {
     // reboot claiming a tunnel is up.
     let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(base).join("pvpnd.state")
+}
+
+fn busy_path() -> PathBuf {
+    // Runtime dir for the same reason as the state file: a marker that
+    // outlived a reboot would silence the daemon for two minutes at boot.
+    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(base).join("pvpn.busy")
 }
 
 fn config_path() -> PathBuf {
@@ -134,6 +148,132 @@ fn read_intent() -> Intent {
     }
 }
 
+/// Record intent on the user's behalf, when they expressed it somewhere
+/// other than the pvpn CLI - i.e. the GNOME VPN switch.
+fn write_intent(i: Intent) {
+    let p = intent_path();
+    if let Some(dir) = p.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let word = match i {
+        Intent::Up => "up",
+        Intent::Down => "down",
+        Intent::Unset => return,
+    };
+    // Same temp+rename pvpn uses: a half-written intent file read by the
+    // next tick would be worse than no file at all.
+    let tmp = p.with_extension("tmp");
+    if fs::write(&tmp, format!("{word}\n")).is_ok() {
+        let _ = fs::rename(&tmp, &p);
+    }
+}
+
+/// Is pvpn itself mid-operation right now?
+///
+/// During a connect there is a real window where NetworkManager shows no
+/// VPN at all - the old one is gone and the new one has not arrived. Read
+/// naively that is indistinguishable from you switching the VPN off in
+/// GNOME, and pvpnd would "helpfully" stand down halfway through your own
+/// `pvpn up`. pvpn drops this marker for the length of any operation that
+/// touches the tunnel, and we simply do not judge NM while it is there.
+fn pvpn_is_busy() -> bool {
+    let p = busy_path();
+    let meta = match fs::metadata(&p) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    // A crashed pvpn must not wedge the daemon forever, so the marker
+    // expires. Two minutes is comfortably longer than the slowest measured
+    // connect (41s on detnsw) and far shorter than "until you reboot".
+    match meta.modified().ok().and_then(|t| t.elapsed().ok()) {
+        Some(age) => age < Duration::from_secs(120),
+        None => true,
+    }
+}
+
+/// The VPN as NetworkManager sees it, which is what GNOME's switch drives.
+/// Returns the connection name, or None when no VPN is up.
+///
+/// Polled rather than subscribed to on purpose: watching signals on the
+/// system bus needs root (`gdbus monitor --system` is refused for a user
+/// session), and pvpnd deliberately runs as you, not as root. One nmcli
+/// call per tick is the price. It replaces the old `pvpn status` call,
+/// which spawned the whole Python client to answer the same question.
+///
+/// Any active vpn/wireguard profile counts, not just ones named "ProtonVPN":
+/// hopping leaves profiles named after bare server IPs.
+fn nm_vpn_connection() -> Option<String> {
+    let out = Command::new("nmcli")
+        .args(["-t", "-f", "NAME,TYPE", "connection", "show", "--active"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        // -t output is colon-separated; a connection name may itself contain
+        // an escaped colon, so take the TYPE from the END, not from field 2.
+        let (name, kind) = match line.rsplit_once(':') {
+            Some(pair) => pair,
+            None => continue,
+        };
+        if kind == "vpn" || kind == "wireguard" {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Why did the VPN go away?
+#[derive(PartialEq, Debug, Clone, Copy)]
+enum Reason {
+    /// Somebody asked for it: the GNOME switch, nmcli, pvpn down.
+    Deliberate,
+    /// It fell over.
+    Failure,
+    Unknown,
+}
+
+/// Ask NetworkManager's journal why the tunnel went down.
+///
+/// This is the entire difference between "you turned it off" and "it broke",
+/// and getting it wrong is bad in both directions - reconnecting after you
+/// deliberately toggled the switch is the behaviour that makes a daemon
+/// hateful, and standing down after a fault defeats the point of having one.
+///
+/// NM writes the answer in its state-change lines:
+///     device (proton0): state change: ... (reason 'user-requested' ...
+/// Matched as plain substrings, so if NM ever rewords these we degrade to
+/// Unknown - which the caller resolves by other means - rather than
+/// confidently misreading them.
+fn nm_disconnect_reason() -> Reason {
+    let out = Command::new("journalctl")
+        .args(["-u", "NetworkManager", "--since", "-120s", "--no-pager", "-o", "cat"])
+        .stderr(Stdio::null())
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(_) => return Reason::Unknown,
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Last verdict wins: we want the most recent transition, not the first.
+    let mut verdict = Reason::Unknown;
+    for line in text.lines() {
+        if !line.contains("state change:") {
+            continue;
+        }
+        if line.contains("reason 'user-requested'") || line.contains("reason 'connection-removed'")
+        {
+            verdict = Reason::Deliberate;
+        } else if line.contains("reason 'login-failed'")
+            || line.contains("reason 'no-secrets'")
+            || line.contains("reason 'service-start-failed'")
+            || line.contains("-> failed")
+        {
+            verdict = Reason::Failure;
+        }
+    }
+    verdict
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -145,21 +285,6 @@ fn log(msg: &str) {
     // stdout is the journal under systemd; no log file to rotate.
     println!("[{}] {}", now_secs(), msg);
     let _ = std::io::stdout().flush();
-}
-
-/// Does the client believe it is connected?
-fn client_says_connected() -> bool {
-    Command::new(pvpn_bin())
-        .arg("status")
-        .stderr(Stdio::null())
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(|l| l.trim().starts_with("Status:") && l.contains("Connected")
-                    && !l.contains("Disconnected"))
-        })
-        .unwrap_or(false)
 }
 
 /// Is traffic ACTUALLY passing?
@@ -263,7 +388,61 @@ fn main() {
 
     loop {
         let intent = read_intent();
-        let connected = client_says_connected();
+        // NetworkManager, not the Proton client, is the source of truth for
+        // "is there a tunnel": it is what GNOME's switch acts on, and it is
+        // one cheap call instead of spawning the whole Python client.
+        let nm_vpn = nm_vpn_connection();
+        let connected = nm_vpn.is_some();
+
+        // --- NetworkManager as a second place you can express intent -----
+        //
+        // Skipped while pvpn is mid-operation. During a connect NM honestly
+        // shows no VPN for a few seconds, and reading that as "they turned
+        // it off in GNOME" would make pvpnd abandon your own `pvpn up`.
+        if !pvpn_is_busy() {
+            if intent != Intent::Up && connected {
+                // Switched on from outside - the GNOME menu, or nmcli.
+                // Adopt it, so status, the GUI and the daemon agree, and so
+                // it gets kept alive like any tunnel pvpn started itself.
+                log(&format!(
+                    "VPN switched on outside pvpn ({}) - adopting, intent=up",
+                    nm_vpn.as_deref().unwrap_or("?")
+                ));
+                write_intent(Intent::Up);
+                write_state(true, true, Intent::Up, "adopted a VPN started outside pvpn");
+                strikes = 0;
+                backoff = Duration::from_secs(0);
+                std::thread::sleep(interval);
+                continue;
+            }
+
+            if intent == Intent::Up && !connected {
+                // Gone from NM entirely. That is NOT what a broken tunnel
+                // looks like here: the failure this daemon exists for
+                // leaves proton0 "activated" and merely stops passing
+                // packets. A vanished connection means something took it
+                // down - so find out whether that something was you.
+                let deliberate = match nm_disconnect_reason() {
+                    Reason::Deliberate => true,
+                    Reason::Failure => false,
+                    // NM did not say. If the internet works without the
+                    // tunnel then you are online and VPN-less, which is
+                    // what the switch being off looks like. If it does not,
+                    // the network itself went away - keep intent and wait,
+                    // or turning off the wifi would silently disarm pvpnd.
+                    Reason::Unknown => traffic_flows(probe_timeout),
+                };
+                if deliberate {
+                    log("VPN switched off outside pvpn - standing down (intent=down)");
+                    write_intent(Intent::Down);
+                    write_state(false, false, Intent::Down, "switched off outside pvpn");
+                    strikes = 0;
+                    backoff = Duration::from_secs(0);
+                    std::thread::sleep(interval);
+                    continue;
+                }
+            }
+        }
 
         // Nothing to maintain unless the user asked to be up.
         if intent != Intent::Up {

@@ -75,6 +75,16 @@ set_intent() {
     mkdir -p "$(dirname "$PVPN_INTENT")" 2>/dev/null || return 0
     printf '%s\n' "$1" > "$PVPN_INTENT" 2>/dev/null || true
 }
+
+# pvpnd also watches NetworkManager, so that turning the VPN off in GNOME
+# means the same thing as `pvpn down`. That leaves one trap: while we are
+# connecting, NM genuinely shows no VPN for a few seconds, which looks
+# exactly like you having switched it off. This marker says "pvpn is mid-
+# operation, do not read anything into NM right now". pvpnd ignores it once
+# it goes stale, so a crash here cannot mute the daemon for good.
+PVPN_BUSY="${XDG_RUNTIME_DIR:-/tmp}/pvpn.busy"
+mark_busy()  { printf '%s\n' "$$" > "$PVPN_BUSY" 2>/dev/null || true; }
+clear_busy() { rm -f "$PVPN_BUSY" 2>/dev/null || true; }
 # shellcheck source=/dev/null
 [[ -r "$PVPN_CONF" ]] && source "$PVPN_CONF"
 
@@ -127,7 +137,9 @@ cleanup_log() { rm -f "$LOG"; }
 
 # Nothing persistent to undo any more: server steering is an in-memory
 # override (see steer_env below), so a crash leaves no state behind.
-on_exit() { cleanup_log; }
+# clear_busy is here rather than in its own trap because there is already a
+# global EXIT trap, and a second one would silently replace this.
+on_exit() { cleanup_log; clear_busy; }
 trap on_exit EXIT
 
 # --- plumbing ---------------------------------------------------------
@@ -1524,12 +1536,16 @@ Notes:
 EOF
 }
 
+# mark_busy on exactly the commands that move the tunnel. Read-only ones
+# (status, scan, ip, config) must NOT set it: while it is set, pvpnd stops
+# noticing the GNOME switch, so holding it any longer than necessary trades
+# away the integration it exists to protect.
 case "${1:-help}" in
-    up|connect)      shift; cmd_up "$@" ;;
-    hop|next)        shift; cmd_hop "$@" ;;
+    up|connect)      shift; mark_busy; cmd_up "$@" ;;
+    hop|next)        shift; mark_busy; cmd_hop "$@" ;;
     scan)            shift; cmd_scan "${1:-}" ;;
-    best|fastest)    shift; cmd_best "$@" ;;
-    down|disconnect) cmd_down ;;
+    best|fastest)    shift; mark_busy; cmd_best "$@" ;;
+    down|disconnect) mark_busy; cmd_down ;;
     status|st)       cmd_status ;;
     config|cfg)      shift; cmd_config "${1:-}" "${2:-}" ;;
     version|--version|-V) cmd_version ;;
@@ -1537,7 +1553,7 @@ case "${1:-help}" in
     login|signin)    shift; cmd_login "$@" ;;
     account|acct)    shift; cmd_account "${1:-}" ;;
     logout|signout)  cmd_logout ;;
-    try)             cmd_try ;;
+    try)             mark_busy; cmd_try ;;
     protocols|protos) cmd_protocols ;;
     help|-h|--help)  usage ;;
     *)               err "Unknown command: $1"; say ""; usage; exit 1 ;;
