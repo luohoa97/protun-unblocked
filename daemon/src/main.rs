@@ -64,8 +64,19 @@
 //! A signal carries the TRANSITION and NM's own reason code
 //! (USER_DISCONNECTED vs a fault), so that gap does not exist and nothing
 //! has to be inferred.
+//!
+//! Signals alone were still not enough, and the second mistake is worth
+//! recording too. NM's Connection.Active.StateChanged is emitted by EVERY
+//! active connection - wifi, bridges, loopback - not just tunnels. Tearing
+//! the tunnel out re-activates the wifi underneath it, so `pvpn down` was
+//! immediately followed by the wifi announcing ACTIVATED on the very same
+//! interface, with the very same state number a tunnel would use. That was
+//! read as "the user switched the VPN on", intent went back to up, and the
+//! VPN restarted itself. Listening to the right interface is not enough:
+//! the SENDER has to be checked as well, which is what the tunnel path set
+//! in spawn_nm_watcher is for.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -272,7 +283,24 @@ fn parse_state_reason(line: &str, marker: &str) -> Option<(u32, u32)> {
     None
 }
 
-/// Turn one line of gdbus output into an event, if it is one we care about.
+const AC_PREFIX: &str = "/org/freedesktop/NetworkManager/ActiveConnection/";
+
+/// Which interface a signal arrived on, and what it said.
+///
+/// This distinction is not pedantry, it is the bug. `VPN.Connection` is a
+/// VPN-only interface, so anything arriving on it is a tunnel by
+/// construction. `Connection.Active` is the BASE interface that EVERY active
+/// connection implements - wifi, bridges, loopback, virbr0 - so a state
+/// change there says nothing about the VPN until the sender is identified.
+#[derive(PartialEq, Debug, Clone)]
+enum Sig {
+    /// From the VPN-only interface: trust it.
+    Vpn(Ev),
+    /// From the shared interface: vet `path` before believing it.
+    Generic { path: String, ev: Ev },
+}
+
+/// Turn one line of gdbus output into a signal, if it is one we can read.
 ///
 /// Two interfaces, because NetworkManager models the two tunnel kinds
 /// differently and they do NOT share a state enum:
@@ -281,30 +309,125 @@ fn parse_state_reason(line: &str, marker: &str) -> Option<(u32, u32)> {
 ///                                       6=FAILED, 7=DISCONNECTED
 ///   Connection.Active.StateChanged      WireGuard.         2=ACTIVATED,
 ///                                       4=DEACTIVATED
-fn line_to_event(line: &str) -> Option<Ev> {
-    let (activated, gone, (state, reason)) =
-        if line.contains(".VPN.Connection.VpnStateChanged") {
-            (5u32, [6u32, 7u32], parse_state_reason(line, "VpnStateChanged")?)
-        } else if line.contains(".Connection.Active.StateChanged") {
-            (2u32, [4u32, 4u32], parse_state_reason(line, "StateChanged")?)
-        } else {
-            return None;
-        };
+fn parse_signal(line: &str) -> Option<Sig> {
+    let generic = if line.contains(".VPN.Connection.VpnStateChanged") {
+        false
+    } else if line.contains(".Connection.Active.StateChanged") {
+        true
+    } else {
+        return None;
+    };
 
-    if state == activated {
-        return Some(Ev::Activated);
-    }
-    if gone.contains(&state) {
-        // THE line that fixes `pvpn down`. NM says outright whether a human
-        // asked for this, so there is no window to sample wrongly and no
-        // guessing from whether the internet happens to work.
-        return Some(if reason == REASON_USER_DISCONNECTED || reason == REASON_CONNECTION_REMOVED {
+    let (activated, gone, (state, reason)) = if generic {
+        (2u32, [4u32, 4u32], parse_state_reason(line, "StateChanged")?)
+    } else {
+        (5u32, [6u32, 7u32], parse_state_reason(line, "VpnStateChanged")?)
+    };
+
+    let ev = if state == activated {
+        Ev::Activated
+    } else if gone.contains(&state) {
+        // NM says outright whether a human asked for this, so there is no
+        // window to sample wrongly and no guessing from whether the
+        // internet happens to work.
+        if reason == REASON_USER_DISCONNECTED || reason == REASON_CONNECTION_REMOVED {
             Ev::WentDownDeliberately
         } else {
             Ev::Failed
-        });
+        }
+    } else {
+        return None;
+    };
+
+    if !generic {
+        return Some(Sig::Vpn(ev));
     }
-    None
+    // "/org/.../ActiveConnection/9: org.freedesktop..." - the sender is
+    // everything before the first ": ".
+    let path = line.split_once(": ")?.0.trim().to_string();
+    if !path.starts_with(AC_PREFIX) {
+        return None;
+    }
+    Some(Sig::Generic { path, ev })
+}
+
+/// The system bus address. A systemd *user* service does not inherit it, and
+/// without it gdbus fails with "No such file or directory" - which reads like
+/// a permissions problem and is not one.
+fn dbus_addr() -> String {
+    std::env::var("DBUS_SYSTEM_BUS_ADDRESS")
+        .unwrap_or_else(|_| "unix:path=/run/dbus/system_bus_socket".into())
+}
+
+/// Read one property off a NetworkManager object as raw gdbus text.
+fn nm_get(path: &str, iface: &str, prop: &str) -> Option<String> {
+    let out = Command::new("gdbus")
+        .args([
+            "call",
+            "--system",
+            "--dest",
+            "org.freedesktop.NetworkManager",
+            "--object-path",
+            path,
+            "--method",
+            "org.freedesktop.DBus.Properties.Get",
+            iface,
+            prop,
+        ])
+        .env("DBUS_SYSTEM_BUS_ADDRESS", dbus_addr())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Pull the first quoted value out of gdbus output: `(<'wireguard'>,)`.
+fn first_quoted(raw: &str) -> Option<String> {
+    let (_, rest) = raw.split_once('\'')?;
+    Some(rest.chars().take_while(|c| *c != '\'').collect())
+}
+
+/// Is the active connection at `path` actually a tunnel?
+///
+/// Sampling NM here is safe in a way the old polling loop was not: this only
+/// runs just after NM reported ACTIVATED, so the object exists by definition.
+/// We are identifying something that is present, not guessing whether
+/// something is still there.
+fn is_tunnel_path(path: &str) -> bool {
+    let raw = match nm_get(
+        path,
+        "org.freedesktop.NetworkManager.Connection.Active",
+        "Type",
+    ) {
+        Some(s) => s,
+        None => return false,
+    };
+    matches!(first_quoted(&raw).as_deref(), Some("vpn") | Some("wireguard"))
+}
+
+/// Which active connections are tunnels right now.
+///
+/// Seeded when the watcher starts so a tunnel that was already up before the
+/// daemon started is still recognised when it later goes away.
+fn seed_tunnel_paths() -> HashSet<String> {
+    let mut set = HashSet::new();
+    let raw = match nm_get(
+        "/org/freedesktop/NetworkManager",
+        "org.freedesktop.NetworkManager",
+        "ActiveConnections",
+    ) {
+        Some(s) => s,
+        None => return set,
+    };
+    // (<[objectpath '/org/...', '/org/...']>,)
+    for token in raw.split('\'') {
+        if token.starts_with(AC_PREFIX) && is_tunnel_path(token) {
+            set.insert(token.to_string());
+        }
+    }
+    set
 }
 
 /// Watch NetworkManager's D-Bus signals forever, forwarding events.
@@ -322,6 +445,9 @@ fn line_to_event(line: &str) -> Option<Ev> {
 /// systemd *user* service does not inherit it.
 fn spawn_nm_watcher(tx: Sender<Ev>) {
     std::thread::spawn(move || loop {
+        // Re-seeded per gdbus session, so a NetworkManager restart cannot
+        // leave us holding stale object paths.
+        let mut tunnels = seed_tunnel_paths();
         let child = Command::new("gdbus")
             .args(["monitor", "--system", "--dest", "org.freedesktop.NetworkManager"])
             .env(
@@ -337,7 +463,40 @@ fn spawn_nm_watcher(tx: Sender<Ev>) {
             Ok(mut c) => {
                 if let Some(out) = c.stdout.take() {
                     for line in BufReader::new(out).lines().map_while(Result::ok) {
-                        if let Some(ev) = line_to_event(&line) {
+                        let ev = match parse_signal(&line) {
+                            Some(Sig::Vpn(ev)) => Some(ev),
+                            // Every active connection speaks on this
+                            // interface, so an ACTIVATED here is only ours if
+                            // NM says the sender is a tunnel. Skipping this
+                            // check is what made `pvpn down` bounce straight
+                            // back up: tearing the tunnel out re-activates
+                            // the wifi, and the wifi's own ACTIVATED was
+                            // being read as "the user switched the VPN on".
+                            Some(Sig::Generic {
+                                path,
+                                ev: Ev::Activated,
+                            }) => {
+                                if is_tunnel_path(&path) {
+                                    tunnels.insert(path);
+                                    Some(Ev::Activated)
+                                } else {
+                                    None
+                                }
+                            }
+                            // On the way out the object may already be gone
+                            // and so cannot be interrogated - which is
+                            // exactly why tunnels are remembered on the way
+                            // in.
+                            Some(Sig::Generic { path, ev }) => {
+                                if tunnels.remove(&path) {
+                                    Some(ev)
+                                } else {
+                                    None
+                                }
+                            }
+                            None => None,
+                        };
+                        if let Some(ev) = ev {
                             if tx.send(ev).is_err() {
                                 return; // main loop is gone
                             }
@@ -642,35 +801,71 @@ mod tests {
 
         // GNOME switch off / pvpn down: DISCONNECTED + USER_DISCONNECTED.
         assert_eq!(
-            line_to_event(&format!("{vpn} (uint32 7, uint32 2)")),
-            Some(Ev::WentDownDeliberately)
+            parse_signal(&format!("{vpn} (uint32 7, uint32 2)")),
+            Some(Sig::Vpn(Ev::WentDownDeliberately))
         );
         // Profile deleted, as `pvpn hop` does: CONNECTION_REMOVED.
         assert_eq!(
-            line_to_event(&format!("{vpn} (uint32 7, uint32 11)")),
-            Some(Ev::WentDownDeliberately)
+            parse_signal(&format!("{vpn} (uint32 7, uint32 11)")),
+            Some(Sig::Vpn(Ev::WentDownDeliberately))
         );
         // LOGIN_FAILED is a fault - standing down here would disable
         // autoreconnect exactly when it is needed.
         assert_eq!(
-            line_to_event(&format!("{vpn} (uint32 6, uint32 10)")),
-            Some(Ev::Failed)
+            parse_signal(&format!("{vpn} (uint32 6, uint32 10)")),
+            Some(Sig::Vpn(Ev::Failed))
         );
         assert_eq!(
-            line_to_event(&format!("{vpn} (uint32 5, uint32 1)")),
-            Some(Ev::Activated)
+            parse_signal(&format!("{vpn} (uint32 5, uint32 1)")),
+            Some(Sig::Vpn(Ev::Activated))
         );
 
         // WireGuard reports on a different interface with a different enum:
-        // 2 = ACTIVATED, 4 = DEACTIVATED.
+        // 2 = ACTIVATED, 4 = DEACTIVATED. It carries the sender's path,
+        // because that interface is shared with everything else on the box.
+        let p = "/org/freedesktop/NetworkManager/ActiveConnection/9";
         assert_eq!(
-            line_to_event(&format!("{act} (uint32 2, uint32 1)")),
-            Some(Ev::Activated)
+            parse_signal(&format!("{act} (uint32 2, uint32 1)")),
+            Some(Sig::Generic {
+                path: p.to_string(),
+                ev: Ev::Activated
+            })
         );
         assert_eq!(
-            line_to_event(&format!("{act} (uint32 4, uint32 2)")),
-            Some(Ev::WentDownDeliberately)
+            parse_signal(&format!("{act} (uint32 4, uint32 2)")),
+            Some(Sig::Generic {
+                path: p.to_string(),
+                ev: Ev::WentDownDeliberately
+            })
         );
+    }
+
+    /// THE regression. `Connection.Active.StateChanged` is emitted by every
+    /// active connection on the machine, so the wifi coming back after a
+    /// tunnel is torn down looks byte-for-byte like a tunnel activating -
+    /// same interface, same state 2. The ONLY thing separating them is the
+    /// sender's object path, so the parser must carry it out intact and must
+    /// never collapse the two into a bare "Activated".
+    ///
+    /// Reported as: "pvpn down just restarts the vpn".
+    #[test]
+    fn wifi_and_tunnel_activations_are_distinguishable() {
+        let wifi = "/org/freedesktop/NetworkManager/ActiveConnection/303: \
+                    org.freedesktop.NetworkManager.Connection.Active.StateChanged \
+                    (uint32 2, uint32 1)";
+        let tun = "/org/freedesktop/NetworkManager/ActiveConnection/9: \
+                   org.freedesktop.NetworkManager.Connection.Active.StateChanged \
+                   (uint32 2, uint32 1)";
+
+        let (a, b) = (parse_signal(wifi), parse_signal(tun));
+        assert_ne!(a, b, "wifi and tunnel activations must not be equal");
+        match (a, b) {
+            (Some(Sig::Generic { path: pa, .. }), Some(Sig::Generic { path: pb, .. })) => {
+                assert!(pa.ends_with("/303"));
+                assert!(pb.ends_with("/9"));
+            }
+            other => panic!("expected two Generic signals, got {other:?}"),
+        }
     }
 
     /// Anything we do not positively recognise must be inert. A daemon that
@@ -680,19 +875,29 @@ mod tests {
         let vpn = "/org/freedesktop/NetworkManager/ActiveConnection/12: \
                    org.freedesktop.NetworkManager.VPN.Connection.VpnStateChanged";
         // Mid-transition states are not decisions.
-        assert_eq!(line_to_event(&format!("{vpn} (uint32 3, uint32 1)")), None);
+        assert_eq!(parse_signal(&format!("{vpn} (uint32 3, uint32 1)")), None);
         // Unrelated NM chatter.
         assert_eq!(
-            line_to_event(
+            parse_signal(
                 "/org/freedesktop/NetworkManager/AccessPoint/13177: \
                  org.freedesktop.DBus.Properties.PropertiesChanged ('x',)"
             ),
             None
         );
         // Malformed payload must yield None, never a misparse.
-        assert_eq!(line_to_event(&format!("{vpn} (garbage)")), None);
-        assert_eq!(line_to_event(&format!("{vpn} (uint32 7)")), None);
-        assert_eq!(line_to_event(""), None);
+        assert_eq!(parse_signal(&format!("{vpn} (garbage)")), None);
+        assert_eq!(parse_signal(&format!("{vpn} (uint32 7)")), None);
+        assert_eq!(parse_signal(""), None);
+        // A shared-interface signal from something that is not an active
+        // connection at all has no path to vet, so it cannot be believed.
+        assert_eq!(
+            parse_signal(
+                "/org/freedesktop/NetworkManager/Devices/2: \
+                 org.freedesktop.NetworkManager.Connection.Active.StateChanged \
+                 (uint32 2, uint32 1)"
+            ),
+            None
+        );
     }
 
     #[test]

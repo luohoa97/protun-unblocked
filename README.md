@@ -234,6 +234,18 @@ from GNOME, and adopted it back to `intent=up`. Autoreconnect did the rest,
 and **the VPN would not stay off**. A signal carries the transition *and* the
 reason, so that gap does not exist and nothing has to be inferred.
 
+**Signals alone were still not enough.** NetworkManager's
+`Connection.Active.StateChanged` is emitted by *every* active connection —
+your wifi, `virbr0`, `waydroid0`, even loopback — not just tunnels. Tearing a
+tunnel out re-activates the wifi underneath it, so `pvpn down` was promptly
+followed by the *wifi* announcing `ACTIVATED`, on the same interface and with
+the same state number a tunnel uses. pvpnd read that as "the user switched the
+VPN on", set `intent=up`, and put the tunnel back. Subscribing to the right
+interface is only half of it — the **sender** has to be checked too. pvpnd now
+asks NetworkManager the type of the connection that spoke, and remembers which
+object paths are tunnels so it can still recognise them on the way out, when
+the object is already gone and can no longer be asked.
+
 While `pvpn` is mid-connect it drops a marker at
 `$XDG_RUNTIME_DIR/pvpn.busy`. `pvpn hop` legitimately produces a deliberate
 disconnect followed by an activate, and acting on the first half would leave
