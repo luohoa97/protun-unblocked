@@ -6,9 +6,38 @@ without internet when a connect fails.
 
 ```
 pvpn up        connect          pvpn status   where am I exiting?
-pvpn down      disconnect       pvpn try      try every protocol
+pvpn down      disconnect       pvpn fast     what this network liked
+pvpn hop       change server    pvpn blocked  what it refused, and why
+pvpn best      rank and connect pvpn apps     what skips the tunnel?
 pvpn login     sign in          vpn-check     will a VPN work on this wifi?
 ```
+
+Unlike a one-shot script, it **remembers what this network taught it** — a
+per-network record of which servers were quick, which refused, and how many
+connects to each actually worked here. And `pvpnd` keeps the tunnel alive
+when it dies silently, which it does more often than you would think.
+
+## Layout
+
+Rust workspace. `pvpn up`, `down`, `hop`, `best`, `status`, `fast`,
+`blocked`, `apps` and `state` are Rust; `login`, `scan`, `try`,
+`protocols` and `fix` still delegate to the bash implementation, installed
+alongside as `pvpn-legacy`, while they are ported.
+
+```
+crates/pvpn-core   paths, config, intent, NetworkManager, probing, memory
+crates/pvpn        the CLI
+crates/pvpnd       the daemon
+crates/pvpn-gui    GTK4 GUI (outside the workspace; built on demand)
+lib/*.py           the Proton shim and the server scanner, still Python
+```
+
+The scanner stays Python on purpose. It probes ~70 servers concurrently by
+TLS handshake and already encodes why TCP timing is worthless here — it
+measured 1.6ms to a US server from Australia, which is physically
+impossible, because a middlebox was completing the TCP handshake locally.
+Rewriting a working, well-reasoned measurement tool would be motion, not
+progress.
 
 ## Why this exists
 
@@ -320,6 +349,11 @@ desirable: a loaded server is a bad pick regardless of distance.
 ## License
 
 **GPL-3.0-or-later** — see [LICENSE](LICENSE).
+
+Parts of this came from
+[dixonSolutions/protun-unblocked](https://github.com/dixonSolutions/protun-unblocked)
+under MIT, which is GPL-compatible. What was taken, from where, and under
+what terms is recorded in [NOTICE.md](NOTICE.md).
 
 This is copyleft. If you distribute this code, or anything derived from it,
 you must:
