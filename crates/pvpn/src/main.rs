@@ -54,10 +54,7 @@ enum Cmd {
 
     /// Change server: anywhere but the one you are on.
     #[command(alias = "next")]
-    Hop {
-        /// Country, city or server name to move to.
-        pattern: Option<String>,
-    },
+    Hop(UpFlags),
 
     /// Rank the servers this network can actually use, then connect.
     #[command(alias = "fastest")]
@@ -98,8 +95,24 @@ enum Cmd {
 
 #[derive(clap::Args, Default)]
 struct UpFlags {
-    /// Country, city or server name.
+    /// Country, city or server name. Bare words work: `pvpn up japan`.
     pattern: Option<String>,
+
+    // The three filter flags below all feed one comma-joined filter, which
+    // is what the scanner takes. They are kept as separate names because
+    // that is the documented interface and what muscle memory types —
+    // collapsing them into `pattern` alone would silently break every
+    // `pvpn up -c japan` anyone has in a script.
+    /// Country. Repeatable; repeats are OR-ed.
+    #[arg(short = 'c', long = "country")]
+    country: Vec<String>,
+    /// City. Repeatable.
+    #[arg(long = "city")]
+    city: Vec<String>,
+    /// Exact server name, e.g. JP-FREE#5. Repeatable.
+    #[arg(short = 's', long = "server")]
+    server: Vec<String>,
+
     /// Pin a protocol instead of letting the network decide.
     #[arg(short, long)]
     protocol: Option<String>,
@@ -107,7 +120,7 @@ struct UpFlags {
     #[arg(long = "not", value_name = "SERVER")]
     exclude: Vec<String>,
     /// Re-measure instead of using a recent scan.
-    #[arg(long)]
+    #[arg(short = 'f', long, alias = "fastest")]
     rescan: bool,
     /// Skip measurement; let Proton choose.
     #[arg(long = "any", alias = "no-scan")]
@@ -115,21 +128,35 @@ struct UpFlags {
     /// Wait and confirm traffic before returning.
     #[arg(long)]
     verify: bool,
+    /// Skip the traffic check (the default).
+    #[arg(long, conflicts_with = "verify")]
+    no_verify: bool,
     /// How many servers to try before giving up.
     #[arg(long, default_value_t = 3)]
     attempts: usize,
 }
 
 impl UpFlags {
+    /// Join every filter source into the one comma-separated string the
+    /// scanner understands. Order is stable so the scan cache key is too.
+    fn filter(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        parts.extend(self.pattern.clone());
+        parts.extend(self.country.iter().cloned());
+        parts.extend(self.city.iter().cloned());
+        parts.extend(self.server.iter().cloned());
+        (!parts.is_empty()).then(|| parts.join(","))
+    }
+
     fn into_args(self, hop: bool) -> connect::UpArgs {
         connect::UpArgs {
-            filter: self.pattern,
-            protocol: self.protocol,
-            exclude: self.exclude,
+            filter: self.filter(),
+            protocol: self.protocol.clone(),
+            exclude: self.exclude.clone(),
             hop,
             rescan: self.rescan,
             no_scan: self.no_scan,
-            verify: self.verify,
+            verify: self.verify && !self.no_verify,
             attempts: self.attempts.clamp(1, 10),
         }
     }
@@ -174,14 +201,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Status => cmd_status(&cfg, cli.json),
         Cmd::State => cmd_state(),
         Cmd::Up(f) => connect::cmd_up(&cfg, f.into_args(false)).map(ExitCode::from),
-        Cmd::Best(f) => connect::cmd_up(&cfg, f.into_args(false)).map(ExitCode::from),
-        Cmd::Hop { pattern } => {
-            let f = UpFlags {
-                pattern,
-                ..Default::default()
-            };
-            connect::cmd_up(&cfg, f.into_args(true)).map(ExitCode::from)
+        Cmd::Best(mut f) => {
+            // `best` means "measure, then connect". Reusing a cached scan
+            // would make it a slower synonym for `up`.
+            f.rescan = true;
+            connect::cmd_up(&cfg, f.into_args(false)).map(ExitCode::from)
         }
+        // hop is `up` with the current server excluded, so it inherits the
+        // ranking and every flag rather than reimplementing them.
+        Cmd::Hop(f) => connect::cmd_up(&cfg, f.into_args(true)).map(ExitCode::from),
         Cmd::Down => connect::cmd_down(&cfg).map(ExitCode::from),
         Cmd::Fast => memory_cmd::cmd_fast(&cfg, cli.json).map(ExitCode::from),
         Cmd::Blocked => memory_cmd::cmd_blocked(&cfg, cli.json).map(ExitCode::from),
@@ -340,6 +368,119 @@ fn legacy_path() -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// Repeated and mixed filters must all reach the scanner. Dropping any
+    /// of them silently connects you somewhere else.
+    #[test]
+    fn every_filter_source_reaches_the_scanner() {
+        let f = UpFlags {
+            pattern: Some("japan".into()),
+            country: vec!["JP".into(), "SG".into()],
+            city: vec!["tokyo".into()],
+            server: vec!["JP-FREE#5".into()],
+            ..Default::default()
+        };
+        assert_eq!(f.filter().as_deref(), Some("japan,JP,SG,tokyo,JP-FREE#5"));
+    }
+
+    #[test]
+    fn no_filter_is_none_not_an_empty_string() {
+        // An empty string would become a filter matching nothing, and
+        // `pvpn up` would report "nothing matched" on a healthy network.
+        assert_eq!(UpFlags::default().filter(), None);
+    }
+
+    #[test]
+    fn no_verify_beats_verify_default() {
+        let f = UpFlags {
+            no_verify: true,
+            ..Default::default()
+        };
+        assert!(!f.into_args(false).verify);
+    }
+
+    #[test]
+    fn attempts_are_clamped_to_something_sane() {
+        let f = UpFlags {
+            attempts: 9999,
+            ..Default::default()
+        };
+        assert_eq!(f.into_args(false).attempts, 10);
+        let f = UpFlags {
+            attempts: 0,
+            ..Default::default()
+        };
+        assert_eq!(f.into_args(false).attempts, 1);
+    }
+
+    /// Every invocation the README documents must parse.
+    ///
+    /// In-process on purpose. An earlier version of this check shelled out
+    /// to the built binary with the flags appended, which does not test
+    /// parsing — it RUNS them, and `pvpn up --any` on a live machine
+    /// attempts a real connect. Parsing is what is under test here, so
+    /// parsing is all this does.
+    #[test]
+    fn every_documented_invocation_parses() {
+        let cases: &[&[&str]] = &[
+            &["pvpn", "up"],
+            &["pvpn", "up", "japan"],
+            &["pvpn", "up", "-c", "japan"],
+            &["pvpn", "up", "-c", "JP", "-c", "SG"],
+            &["pvpn", "up", "--city", "tokyo"],
+            &["pvpn", "up", "-s", "JP-FREE#5"],
+            &["pvpn", "up", "-p", "wireguard"],
+            &["pvpn", "up", "--fastest"],
+            &["pvpn", "up", "-f"],
+            &["pvpn", "up", "--any"],
+            &["pvpn", "up", "--no-scan"],
+            &["pvpn", "up", "--verify"],
+            &["pvpn", "up", "--not", "SG-FREE#12"],
+            &["pvpn", "up", "--attempts", "5"],
+            &["pvpn", "down"],
+            &["pvpn", "disconnect"],
+            &["pvpn", "hop"],
+            &["pvpn", "hop", "JP"],
+            &["pvpn", "hop", "--not", "SG-FREE#12"],
+            &["pvpn", "next"],
+            &["pvpn", "best"],
+            &["pvpn", "best", "-c", "JP"],
+            &["pvpn", "fastest"],
+            &["pvpn", "status"],
+            &["pvpn", "st"],
+            &["pvpn", "status", "--json"],
+            &["pvpn", "fast"],
+            &["pvpn", "blocked"],
+            &["pvpn", "apps"],
+            &["pvpn", "apps", "--fix"],
+            &["pvpn", "state"],
+            &["pvpn", "protocols"],
+            &["pvpn", "-v", "status"],
+        ];
+        for argv in cases {
+            if let Err(e) = Cli::try_parse_from(*argv) {
+                panic!("`{}` must parse: {e}", argv.join(" "));
+            }
+        }
+    }
+
+    /// Nonsense must be rejected, or a typo silently connects you
+    /// somewhere you did not ask for.
+    #[test]
+    fn nonsense_is_rejected() {
+        for argv in [
+            vec!["pvpn"],
+            vec!["pvpn", "not-a-command"],
+            vec!["pvpn", "up", "--not-a-flag"],
+            vec!["pvpn", "up", "--attempts", "banana"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "`{}` must NOT parse",
+                argv.join(" ")
+            );
+        }
+    }
 
     #[test]
     fn cli_definition_is_valid() {
