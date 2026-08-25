@@ -65,6 +65,14 @@ pub struct Config {
     /// debugging the network itself.
     pub autoreconnect: bool,
 
+    /// How many proven servers this network needs before `pvpn up` stops
+    /// measuring and just uses what it learned.
+    ///
+    /// Three is enough to have a first choice and two fallbacks. Set it
+    /// higher to keep measuring for longer, or to 0 to always trust the
+    /// memory once it has anything at all.
+    pub trust_after_servers: u64,
+
     /// Seconds before a reconnect attempt is killed. A hung `pvpn up` with
     /// no limit wedges the daemon indefinitely, and systemd cannot tell
     /// because the process is still alive.
@@ -85,6 +93,7 @@ impl Default for Config {
             strikes: 3,
             autoreconnect: true,
             reconnect_timeout: 120,
+            trust_after_servers: 3,
         }
     }
 }
@@ -156,6 +165,7 @@ impl Config {
             "strikes" => num(value, &mut self.strikes),
             "autoreconnect" => self.autoreconnect = truthy(value, self.autoreconnect),
             "reconnect_timeout" => num(value, &mut self.reconnect_timeout),
+            "trust_after_servers" => num(value, &mut self.trust_after_servers),
             // Unknown keys are ignored, not rejected. Old installs carry
             // settings from removed features, and refusing to load over one
             // of them would be a worse failure than ignoring it.
@@ -193,6 +203,7 @@ impl Config {
         self.probe_timeout = self.probe_timeout.clamp(1, 30);
         self.strikes = self.strikes.clamp(1, 20);
         self.reconnect_timeout = self.reconnect_timeout.clamp(30, 900);
+        self.trust_after_servers = self.trust_after_servers.min(20);
         self.connect_timeout_secs = self.connect_timeout_secs.clamp(5, 600);
         self.settle_secs = self.settle_secs.clamp(0, 600);
     }

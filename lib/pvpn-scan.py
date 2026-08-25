@@ -187,7 +187,13 @@ def main():
     )
     ap.add_argument("pattern", nargs="?", default="")
     ap.add_argument("--samples", type=int, default=2)
-    ap.add_argument("--workers", type=int, default=24)
+    # 6, not 24. At 24 the scan is ~140 TLS handshakes into one provider's
+    # address space in a few seconds - a far louder signature than the
+    # tunnel it exists to choose, and the thing most likely to get an entry
+    # IP blocklisted for everyone who shares it. pvpn now scans rarely
+    # (it remembers what a network taught it), so this being slower is a
+    # good trade.
+    ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--top", type=int, default=10)
     ap.add_argument("--rank", "--prefer", dest="rank",
                     choices=("balanced", "score", "latency", "load"),

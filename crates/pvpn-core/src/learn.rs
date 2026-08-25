@@ -311,6 +311,39 @@ impl NetworkMemory {
         v
     }
 
+    /// Servers with enough evidence to choose between without measuring.
+    ///
+    /// Once a network has taught us which servers actually connect, another
+    /// scan adds nothing and costs a great deal. A scan is ~140 TLS
+    /// handshakes into one provider's address space in a few seconds, from
+    /// one client - by far the most distinctive thing this tool puts on the
+    /// wire, and far more distinctive than the tunnel, which is a single
+    /// long-lived TLS session on 443.
+    ///
+    /// Wanting that burst to be rare is not paranoia; it is the difference
+    /// between an entry IP staying usable and getting blocklisted for
+    /// everyone who shares it.
+    pub fn confident_choices(&self, base_hours: u64) -> Vec<String> {
+        let now = now_secs();
+        let mut usable: Vec<(&String, &ServerRecord)> = self
+            .servers
+            .iter()
+            .filter(|(_, r)| {
+                // Evidence means a connect that WORKED here. Handshake
+                // latency is not enough: it cannot see the retry loop that
+                // makes a server cost 22 seconds.
+                r.ok > 0 && r.connect_ms.is_some() && !r.is_blocked(base_hours, now)
+            })
+            .collect();
+        usable.sort_by(|(an, a), (bn, b)| {
+            a.score()
+                .partial_cmp(&b.score())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| an.cmp(bn))
+        });
+        usable.into_iter().map(|(n, _)| n.clone()).collect()
+    }
+
     /// Drop records nothing has touched in a long time.
     ///
     /// Without this the file grows forever on a laptop that visits many
@@ -467,6 +500,38 @@ mod tests {
         assert_eq!(m.rank(&c, 24), m.rank(&c, 24));
         // Unknown servers all score the same, so name order breaks the tie.
         assert_eq!(m.rank(&c, 24), vec!["A", "M", "Z"]);
+    }
+
+    /// Only servers that have actually connected here count as evidence.
+    /// A handshake measurement is not enough to skip a scan, because it
+    /// cannot see the retry loop that makes a connect cost 22 seconds.
+    #[test]
+    fn confidence_requires_a_working_connect_not_just_a_handshake() {
+        let mut m = NetworkMemory::default();
+
+        // Measured, never connected: not evidence.
+        m.record_latency("measured-only", 50, false);
+
+        // Connected, but we did not time it: not evidence either.
+        m.record_success("no-timing");
+
+        // The real thing.
+        m.record_latency("proven", 300, false);
+        m.record_success("proven");
+        m.record_connect_time("proven", 3_000);
+
+        assert_eq!(m.confident_choices(24), vec!["proven".to_string()]);
+    }
+
+    /// A blocked server is not a choice, however good its history.
+    #[test]
+    fn confidence_excludes_blocked_servers() {
+        let mut m = NetworkMemory::default();
+        m.record_success("A");
+        m.record_connect_time("A", 2_000);
+        assert_eq!(m.confident_choices(24).len(), 1);
+        m.record_failure("A", "refused");
+        assert!(m.confident_choices(24).is_empty());
     }
 
     #[test]

@@ -230,11 +230,35 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
     let network = timing.mark("network-id", net::network_id);
     let mut memory = NetworkMemory::load(&network);
 
+    let mut confident: Vec<String> = Vec::new();
     let targets = if !args.explicit.is_empty() {
         // Named outright: nothing to measure, nothing to choose.
         args.explicit.clone()
     } else if args.no_scan {
         Vec::new()
+    } else if !args.rescan && {
+        let known = memory.confident_choices(cfg.blocked_retry_after_hours);
+        if known.len() >= cfg.trust_after_servers as usize {
+            // Quietest possible connect: no measurement at all, just what
+            // this network has already proven. A scan is ~140 TLS
+            // handshakes into one provider's address space in a few
+            // seconds - by far the most distinctive thing this tool emits,
+            // and the thing most likely to get an entry IP blocklisted for
+            // everyone sharing it.
+            eprintln!(
+                "  using what this network taught us ({} servers, --rescan to remeasure)",
+                known.len()
+            );
+            confident = known;
+            true
+        } else {
+            false
+        }
+    } {
+        confident
+            .into_iter()
+            .filter(|t| !args.exclude.iter().any(|x| x == t))
+            .collect()
     } else {
         let candidates = timing.mark("scan", || scan_candidates(cfg, &args, &network))?;
         let ranked = memory.rank(&candidates, cfg.blocked_retry_after_hours);
@@ -543,7 +567,9 @@ fn scan_candidates(cfg: &Config, args: &UpArgs, network: &str) -> Result<Vec<Str
     let cache = paths::data_dir().join("scan").join(format!("{key}.json"));
 
     if !args.rescan {
-        if let Some(names) = read_fresh_cache(&cache, 60) {
+        // Six hours, not one. Re-measuring a network that has not changed
+        // buys nothing and re-emits the loudest thing this tool does.
+        if let Some(names) = read_fresh_cache(&cache, 360) {
             eprintln!("  using a recent scan of this network (--rescan to redo)");
             return Ok(names);
         }
@@ -556,6 +582,18 @@ fn scan_candidates(cfg: &Config, args: &UpArgs, network: &str) -> Result<Vec<Str
         cmd.arg(f);
     }
     cmd.arg("--json")
+        // Deliberately gentle. The scanner's default was 24 concurrent
+        // probes; across ~70 candidates at 2 samples each that is ~140 TLS
+        // handshakes into one provider's address space in a few seconds,
+        // from a single client. That burst is far more distinctive than the
+        // tunnel it is choosing - a tunnel is one long-lived TLS session on
+        // 443 and looks like any other HTTPS connection.
+        //
+        // Six at a time takes longer and is worth it: the whole point of
+        // the memory is that this runs rarely, so its speed matters much
+        // less than what it looks like when it does.
+        .arg("--workers")
+        .arg("6")
         .env("PYTHONPATH", proton::shim_dir())
         .stderr(Stdio::inherit());
 
