@@ -43,6 +43,18 @@ pub struct ServerRecord {
     pub block_strikes: u32,
     /// Why it was blocked, in words, for `pvpn blocked`.
     pub last_error: Option<String>,
+    /// Best observed time from "activate" to "connected", in ms.
+    ///
+    /// THE number that actually predicts what a connect will cost you here,
+    /// and it is not the handshake latency. On a filtered network protun
+    /// retries a refused entry IP on a fixed 3-second backoff; one server
+    /// was observed taking FIVE attempts and 22 seconds, while its TLS
+    /// handshake time looked ordinary. Handshake latency cannot see that.
+    /// This can, because it is the wall clock the user waited.
+    ///
+    /// Best rather than last, because a single bad round on a flaky network
+    /// should not condemn a server that usually connects immediately.
+    pub connect_ms: Option<u64>,
     /// Last time we touched this record at all.
     pub last_seen: u64,
 }
@@ -99,16 +111,24 @@ impl ServerRecord {
     ///     handshake.
     ///   - Never-measured servers sort last but are not excluded.
     pub fn score(&self) -> f64 {
-        let base = match self.latency_ms {
-            Some(ms) => ms as f64,
-            // Unmeasured: worse than any plausible real measurement, but
-            // finite, so it still ranks above a known-bad server.
-            None => 10_000.0,
+        // Time-to-connected wins outright when we have it, because it is
+        // the only measurement that includes protun's retry loop. A server
+        // whose handshake is quick but which takes five attempts to accept
+        // a tunnel costs the user 22 seconds, and no handshake timing shows
+        // that.
+        let base = match (self.connect_ms, self.latency_ms) {
+            (Some(ms), _) => ms as f64,
+            // No connect on record: fall back to handshake latency, scaled
+            // so the two are roughly comparable. A handshake is a few
+            // hundred ms; a connect is a few seconds.
+            (None, Some(ms)) => ms as f64 * 4.0,
+            // Never measured at all: worse than any plausible measurement,
+            // but finite, so it still ranks above a known-bad server.
+            (None, None) => 40_000.0,
         };
         let intercept_penalty = if self.intercepted { 5_000.0 } else { 0.0 };
         let failure_multiplier = match self.success_rate() {
-            // Never tried here. No evidence either way, so no adjustment —
-            // it competes on latency alone.
+            // Never tried here. No evidence either way, so no adjustment.
             None => 1.0,
             // 1.0 at perfect, 3.0 at never-works.
             Some(rate) => 1.0 + 2.0 * (1.0 - rate),
@@ -183,6 +203,15 @@ impl NetworkMemory {
         let rec = self.entry(server);
         rec.latency_ms = Some(ms);
         rec.intercepted = intercepted;
+    }
+
+    /// Record how long a successful connect actually took.
+    pub fn record_connect_time(&mut self, server: &str, ms: u64) {
+        let rec = self.entry(server);
+        rec.connect_ms = Some(match rec.connect_ms {
+            Some(best) => best.min(ms),
+            None => ms,
+        });
     }
 
     /// Record that connecting to this server produced a working tunnel.
@@ -320,6 +349,36 @@ mod tests {
             fast_liar.score() > honest.score(),
             "a 20ms interceptor must not outrank a 200ms real server"
         );
+    }
+
+    /// THE finding from the NetworkManager journal: a server whose TLS
+    /// handshake is quick can still take five attempts and 22 seconds to
+    /// accept a tunnel, because protun retries a refused entry IP on a
+    /// fixed 3s backoff. Measured connect time must beat handshake latency
+    /// whenever we have it, or ranking keeps choosing the slow one.
+    #[test]
+    fn measured_connect_time_beats_a_fast_handshake() {
+        let mut quick_handshake_slow_connect = rec(Some(50), 5, 0);
+        quick_handshake_slow_connect.connect_ms = Some(22_000);
+
+        let mut slower_handshake_fast_connect = rec(Some(300), 5, 0);
+        slower_handshake_fast_connect.connect_ms = Some(3_000);
+
+        assert!(
+            slower_handshake_fast_connect.score() < quick_handshake_slow_connect.score(),
+            "the server that actually connects in 3s must win"
+        );
+    }
+
+    /// Best, not last: one bad round on a flaky network must not condemn a
+    /// server that usually connects immediately.
+    #[test]
+    fn connect_time_keeps_the_best_observation() {
+        let mut m = NetworkMemory::default();
+        m.record_connect_time("A", 12_000);
+        m.record_connect_time("A", 2_500);
+        m.record_connect_time("A", 9_000);
+        assert_eq!(m.servers["A"].connect_ms, Some(2_500));
     }
 
     /// Expected time to a *working tunnel* is the thing being ordered, not

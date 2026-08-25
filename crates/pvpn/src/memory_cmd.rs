@@ -19,6 +19,7 @@ pub fn cmd_fast(cfg: &Config, json: bool) -> Result<u8> {
                 serde_json::json!({
                     "server": name,
                     "latency_ms": r.latency_ms,
+                    "connect_ms": r.connect_ms,
                     "ok": r.ok,
                     "failed": r.failed,
                     "success_rate": r.success_rate(),
@@ -37,11 +38,20 @@ pub fn cmd_fast(cfg: &Config, json: bool) -> Result<u8> {
     }
 
     println!("Measured on {network}:\n");
-    println!("  {:<18} {:>7}  {:>9}  {}", "SERVER", "TLS", "CONNECTS", "");
+    println!(
+        "  {:<18} {:>7} {:>8}  {:>9}",
+        "SERVER", "TLS", "CONNECT", "CONNECTS"
+    );
     for (name, r) in rows {
         let latency = r
             .latency_ms
             .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "-".into());
+        // The column that matters most on a filtered network: how long the
+        // tunnel actually took to come up, retries included.
+        let connect = r
+            .connect_ms
+            .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
             .unwrap_or_else(|| "-".into());
         // "connects" is the column that separates this from a plain
         // latency table, and it is the one that actually predicts whether
@@ -51,7 +61,7 @@ pub fn cmd_fast(cfg: &Config, json: bool) -> Result<u8> {
             _ => format!("{}/{}", r.ok, r.attempts()),
         };
         let flag = if r.intercepted { "  intercepted" } else { "" };
-        println!("  {name:<18} {latency:>7}  {connects:>9}{flag}");
+        println!("  {name:<18} {latency:>7} {connect:>8}  {connects:>9}{flag}");
     }
     Ok(0)
 }

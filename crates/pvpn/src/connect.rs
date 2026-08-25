@@ -303,6 +303,11 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
                 let elapsed = started.elapsed();
                 if let Some(t) = target {
                     memory.record_success(t);
+                    // The wall clock the user actually waited, which on a
+                    // filtered network is dominated by protun retrying a
+                    // refused entry IP on a 3s backoff - not by anything a
+                    // handshake measurement can see.
+                    memory.record_connect_time(t, elapsed.as_millis() as u64);
                 }
                 let _ = memory.save();
 
