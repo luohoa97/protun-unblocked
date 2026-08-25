@@ -1,3 +1,7 @@
 *.log
 *.pyc
 __pycache__/
+
+# Build output. Was tracked by accident, which made every build show up as
+# a 500KB diff and put a stale binary in the history.
+target/

@@ -1,0 +1,17 @@
+[package]
+name = "pvpnd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Keeps a Proton VPN tunnel alive, and repairs it when it dies"
+
+[[bin]]
+name = "pvpnd"
+path = "src/main.rs"
+
+[dependencies]
+pvpn-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

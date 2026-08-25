@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pvpn-core",
+    "crates/pvpn",
+    "crates/pvpnd",
+]
+
+# The GUI is deliberately OUT of the workspace. It pulls gtk4 and
+# libadwaita, which is a different order of build cost from everything
+# else here, and `cargo build` at the root should stay fast enough to run
+# on every change. It is built on demand (`ujust pvpn-gui-install`).
+exclude = ["crates/pvpn-gui"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/luohoa97/protun-unblocked"
+
+[workspace.dependencies]
+pvpn-core = { path = "crates/pvpn-core" }
+
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "process",
+    "time",
+    "sync",
+    "macros",
+    "io-util",
+    "fs",
+    "signal",
+] }
+native-tls = "0.2"
+regex = "1"
+
+[profile.release]
+opt-level = 2
+# One line of backtrace on a daemon panic is worth more than the few KB it
+# costs: the alternative is a journal entry that says only "panicked".
+debug = 1
+
+[profile.dev]
+opt-level = 0
