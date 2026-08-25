@@ -12,6 +12,9 @@
 //! The delegation target is installed as `pvpn-legacy`, NOT as `pvpn` -
 //! otherwise this binary would find itself and recurse.
 
+mod connect;
+mod memory_cmd;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use pvpn_core::{config::Config, intent, nm, probe, state::DaemonState};
@@ -41,34 +44,96 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Connect, measuring servers first.
+    Up(UpFlags),
+
+    /// Disconnect.
+    #[command(alias = "disconnect")]
+    Down,
+
+    /// Change server: anywhere but the one you are on.
+    #[command(alias = "next")]
+    Hop {
+        /// Country, city or server name to move to.
+        pattern: Option<String>,
+    },
+
+    /// Rank the servers this network can actually use, then connect.
+    #[command(alias = "fastest")]
+    Best(UpFlags),
+
     /// Where am I exiting, and is the tunnel actually carrying traffic?
+    #[command(alias = "st")]
     Status,
+
+    /// What this network measured as quick.
+    Fast,
+
+    /// What this network refused, and why.
+    Blocked,
 
     /// What the daemon last published, verbatim.
     State,
 
     // ---- not yet ported; handed to the bash implementation ----
-    /// Connect, measuring servers first.
-    Up { args: Vec<String> },
-    /// Disconnect.
-    Down,
-    /// Change server.
-    Hop { args: Vec<String> },
-    /// Rank the servers this network can actually use.
-    Best { args: Vec<String> },
     /// Try every protocol.
     Try,
     /// Sign in.
     Login { args: Vec<String> },
-    /// Measure this network.
+    /// Measure this network without connecting.
     Scan { args: Vec<String> },
+    /// Which protocol backends are actually installed.
+    Protocols,
+    /// Privileged cleanup (needs sudo).
+    Fix { args: Vec<String> },
+}
+
+#[derive(clap::Args, Default)]
+struct UpFlags {
+    /// Country, city or server name.
+    pattern: Option<String>,
+    /// Pin a protocol instead of letting the network decide.
+    #[arg(short, long)]
+    protocol: Option<String>,
+    /// Do not connect to this server.
+    #[arg(long = "not", value_name = "SERVER")]
+    exclude: Vec<String>,
+    /// Re-measure instead of using a recent scan.
+    #[arg(long)]
+    rescan: bool,
+    /// Skip measurement; let Proton choose.
+    #[arg(long = "any", alias = "no-scan")]
+    no_scan: bool,
+    /// Wait and confirm traffic before returning.
+    #[arg(long)]
+    verify: bool,
+    /// How many servers to try before giving up.
+    #[arg(long, default_value_t = 3)]
+    attempts: usize,
+}
+
+impl UpFlags {
+    fn into_args(self, hop: bool) -> connect::UpArgs {
+        connect::UpArgs {
+            filter: self.pattern,
+            protocol: self.protocol,
+            exclude: self.exclude,
+            hop,
+            rescan: self.rescan,
+            no_scan: self.no_scan,
+            verify: self.verify,
+            attempts: self.attempts.clamp(1, 10),
+        }
+    }
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
-    match run(&cli) {
+    let json = cli.json;
+    let _ = json;
+    match run(cli) {
         Ok(code) => code,
         Err(e) => {
             // The chain matters: "no such file" alone is useless, "reading
@@ -95,17 +160,28 @@ fn init_tracing(verbose: u8) {
         .try_init();
 }
 
-fn run(cli: &Cli) -> Result<ExitCode> {
-    match &cli.command {
-        Cmd::Status => cmd_status(cli.json),
+fn run(cli: Cli) -> Result<ExitCode> {
+    let cfg = Config::load();
+    match cli.command {
+        Cmd::Status => cmd_status(&cfg, cli.json),
         Cmd::State => cmd_state(),
-        Cmd::Up { args } => delegate("up", args),
-        Cmd::Down => delegate("down", &[]),
-        Cmd::Hop { args } => delegate("hop", args),
-        Cmd::Best { args } => delegate("best", args),
+        Cmd::Up(f) => connect::cmd_up(&cfg, f.into_args(false)).map(ExitCode::from),
+        Cmd::Best(f) => connect::cmd_up(&cfg, f.into_args(false)).map(ExitCode::from),
+        Cmd::Hop { pattern } => {
+            let f = UpFlags {
+                pattern,
+                ..Default::default()
+            };
+            connect::cmd_up(&cfg, f.into_args(true)).map(ExitCode::from)
+        }
+        Cmd::Down => connect::cmd_down(&cfg).map(ExitCode::from),
+        Cmd::Fast => memory_cmd::cmd_fast(&cfg, cli.json).map(ExitCode::from),
+        Cmd::Blocked => memory_cmd::cmd_blocked(&cfg, cli.json).map(ExitCode::from),
         Cmd::Try => delegate("try", &[]),
-        Cmd::Login { args } => delegate("login", args),
-        Cmd::Scan { args } => delegate("scan", args),
+        Cmd::Login { args } => delegate("login", &args),
+        Cmd::Scan { args } => delegate("scan", &args),
+        Cmd::Protocols => delegate("protocols", &[]),
+        Cmd::Fix { args } => delegate("fix", &args),
     }
 }
 
@@ -121,8 +197,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
 ///   0  tunnel up and carrying traffic
 ///   1  no tunnel
 ///   2  tunnel present but carrying nothing  <- the dangerous one
-fn cmd_status(json: bool) -> Result<ExitCode> {
-    let cfg = Config::load();
+fn cmd_status(cfg: &Config, json: bool) -> Result<ExitCode> {
     let tunnel = nm::vpn_connection();
     let want = intent::read();
     let daemon = DaemonState::load();

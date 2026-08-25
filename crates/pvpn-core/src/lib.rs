@@ -24,11 +24,16 @@
 
 pub mod config;
 pub mod intent;
+pub mod learn;
+pub mod net;
 pub mod nm;
 pub mod paths;
 pub mod probe;
+pub mod proton;
 pub mod state;
+pub mod tls;
 
 pub use intent::Intent;
 pub use nm::{Ev, Sig};
+pub use learn::{NetworkMemory, ServerRecord};
 pub use state::DaemonState;

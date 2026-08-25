@@ -1,19 +1,44 @@
 [Unit]
 Description=Keep the Proton VPN tunnel alive (pvpn)
 Documentation=https://github.com/luohoa97/protun-unblocked
-# Not After=network-online.target: this must survive the network going away
-# and coming back, which is the whole point. It handles being offline.
+# Deliberately NOT After=network-online.target: this must survive the
+# network going away and coming back, which is the whole point. It handles
+# being offline.
 PartOf=graphical-session.target
 
 [Service]
-Type=simple
+# Type=exec, not notify: systemd considers the service started once exec
+# succeeds, so a bug in our sd_notify code cannot make the unit fail to
+# start. The watchdog still works, because NotifyAccess is what gates
+# WATCHDOG=1, not the type.
+Type=exec
+NotifyAccess=main
 ExecStart=%h/.local/bin/pvpnd
+
+# THE reason this unit is interesting.
+#
+# Restart=always only helps if the process dies. The failure that actually
+# happens is worse: the daemon is alive, systemd is satisfied, and nothing
+# is happening — a reconnect that never returns, or a wedged loop. The
+# watchdog is the only thing that catches it.
+#
+# 300s is chosen against reconnect_timeout (120s default). A legitimate
+# reconnect must fit comfortably inside this, or a slow-but-working connect
+# would be killed as a hang. The daemon pings at WATCHDOG_USEC/3.
+WatchdogSec=300
+
 Restart=always
 RestartSec=10
+# Never give up. The default (5 starts in 10s) cannot be hit with
+# RestartSec=10, but a future change to that value would silently
+# reintroduce a limit, and a VPN daemon that stops trying is useless.
+StartLimitIntervalSec=0
+
 # It shells out to pvpn, which drives NetworkManager over D-Bus as YOU.
 # Running as the user is required, not merely preferred: Proton keeps
 # per-user state (keyring, settings.json) that root cannot see.
 Slice=session.slice
+
 # Modest hardening. No NoNewPrivileges: pvpn may call sudo to remove a
 # stray kill-switch device.
 PrivateTmp=false

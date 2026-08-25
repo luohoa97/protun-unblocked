@@ -435,8 +435,32 @@ install_pvpn() {
     fi
 
     head_ "Installing pvpn"
-    mkdir -p "$BIN" "$LIB"
-    install -m755 "$SRC/bin/pvpn"      "$BIN/pvpn";      ok "$BIN/pvpn"
+    mkdir -p "$BIN" "$LIB" "$HOME/.local/libexec"
+
+    # The Rust CLI is the front door. The bash implementation stays as
+    # pvpn-legacy for the commands still being ported, and pvpn delegates
+    # to it - it must NOT be installed as `pvpn`, or the Rust binary finds
+    # itself and recurses.
+    if command -v cargo >/dev/null; then
+        say "Building pvpn and pvpnd (Rust)..."
+        if (cd "$SRC" && cargo build --release -p pvpn -p pvpnd --quiet); then
+            install -m755 "$SRC/target/release/pvpn"  "$BIN/pvpn";  ok "$BIN/pvpn (rust)"
+            install -m755 "$SRC/target/release/pvpnd" "$BIN/pvpnd"; ok "$BIN/pvpnd"
+            install -m755 "$SRC/bin/pvpn" "$HOME/.local/libexec/pvpn-legacy"
+            ok "$HOME/.local/libexec/pvpn-legacy"
+            install -Dm644 "$SRC/dist/pvpnd.service" \
+                "$HOME/.config/systemd/user/pvpnd.service"
+            systemctl --user daemon-reload 2>/dev/null || true
+            ok "pvpnd.service (start it with: systemctl --user enable --now pvpnd)"
+        else
+            warn "cargo build failed - installing the bash implementation as pvpn"
+            install -m755 "$SRC/bin/pvpn" "$BIN/pvpn"; ok "$BIN/pvpn (bash)"
+        fi
+    else
+        note "no Rust toolchain (cargo); installing the bash implementation."
+        note "install rustup for the Rust CLI and the daemon."
+        install -m755 "$SRC/bin/pvpn" "$BIN/pvpn"; ok "$BIN/pvpn (bash)"
+    fi
     install -m755 "$SRC/bin/vpn-check" "$BIN/vpn-check"; ok "$BIN/vpn-check"
     install -m644 "$SRC/lib/sitecustomize.py" "$LIB/";   ok "$LIB/sitecustomize.py"
     [[ -f "$SRC/lib/debug-signin.py" ]] && \

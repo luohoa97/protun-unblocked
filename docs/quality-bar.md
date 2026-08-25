@@ -107,8 +107,23 @@ than TCP; and detection of interception rather than treating it as success.
 
 **Target:** match theirs, then exceed it by recording **connect outcomes**
 and not just handshake latency — the only evidence that actually predicts
-whether a server will work here. **Now:** not implemented. **Theirs:**
-implemented and good. *This is where they are ahead.*
+whether a server will work here.
+
+**Now: done.** A correction to an earlier version of this document, which
+said TLS-timed ranking was unimplemented here: `lib/pvpn-scan.py` has
+always done it, and records the same reasoning independently (it measured
+1.6ms to a US server from Australia over TCP, which is physically
+impossible, and switched to TLS). What was genuinely missing was
+*persistence* — measurements died with the process.
+
+`pvpn-core::learn` now keeps a per-network record: measured latency,
+whether the peer looked like an interceptor, and how many connects to that
+server have actually worked *here*. Ranking multiplies latency by a failure
+penalty, so a server that handshakes in 50ms and fails 9 connects in 10
+sorts below one at 120ms that always works — because the thing being
+ordered is expected time to a *working tunnel*, not to a handshake.
+Untried is deliberately distinct from always-fails, or we would never
+discover a good server on a new network.
 
 ### 7. Apps that quietly leave the tunnel
 
@@ -152,18 +167,35 @@ A wedged daemon is worse than a crashed one: systemd restarts a crash.
 caught by a systemd watchdog; a dead signal-watcher thread is detected and
 respawned rather than silently degrading to a timer.
 
-**Target:** all three. **Now:** none of the three — audit done, fixes
-pending. *This is the largest open gap.*
+**Target:** all three. **Now: all three done.**
+
+- Reconnect is wrapped in coreutils `timeout`, which signals the whole
+  process group — killing `pvpn` alone would leave Proton's Python client
+  running and two connects racing.
+- `WatchdogSec=300` with sd_notify spoken directly. Fed from the main loop,
+  never a side thread: a side thread would keep reporting health while the
+  loop was wedged, which is worse than having no watchdog at all.
+- The watcher thread is supervised by its `JoinHandle`. The channel cannot
+  detect its death — the daemon holds a `Sender`, so it never reports
+  disconnected.
 
 ## Where they are ahead today
 
 Stated plainly so it does not get quietly dropped:
 
-- Per-network learning (fast/blocked lists, expiry, backoff) — criterion 6
-- TLS-timed ranking and interception detection — criterion 6
-- Flatpak app routing — criterion 7
-- A real test suite — criterion 8
-- The CLI is already Rust; ours is 1,560 lines of bash
+- Flatpak app routing — criterion 7. Still not implemented here.
+- Test *breadth*. Theirs is ~1,545 lines including a Rust-vs-Python
+  differential run on shared fixtures; that differential idea is good and
+  worth taking.
+
+Closed since the first version of this document:
+
+- Per-network learning — criterion 6, now implemented and arguably ahead,
+  because outcomes are recorded and not just latency.
+- Interception detection — criterion 6, `pvpn-core::tls`.
+- The CLI is Rust. `up`, `down`, `hop`, `best`, `status`, `fast`, `blocked`
+  and `state` are ported; `login`, `scan`, `try`, `protocols` and `fix`
+  still delegate to the bash implementation.
 
 ## What we must not regress
 

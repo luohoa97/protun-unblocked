@@ -38,7 +38,20 @@ impl Watchdog {
     /// daemon must run identically when started by hand from a shell, where
     /// none of these variables exist.
     pub fn from_env() -> Self {
-        let addr = std::env::var("NOTIFY_SOCKET").ok().map(|s| {
+        Self::from_parts(
+            std::env::var("NOTIFY_SOCKET").ok(),
+            std::env::var("WATCHDOG_USEC").ok().and_then(|v| v.parse().ok()),
+        )
+    }
+
+    /// The same logic, with the environment passed in.
+    ///
+    /// Split out so it can be tested without setting process-global env
+    /// vars — three tests doing that in parallel raced each other, which
+    /// made the suite fail intermittently and for a reason that had
+    /// nothing to do with the code under test.
+    pub fn from_parts(notify_socket: Option<String>, watchdog_usec: Option<u64>) -> Self {
+        let addr = notify_socket.map(|s| {
             if let Some(rest) = s.strip_prefix('@') {
                 // Abstract namespace: the leading NUL is the encoding, not
                 // a typo.
@@ -48,9 +61,7 @@ impl Watchdog {
             }
         });
 
-        let interval = std::env::var("WATCHDOG_USEC")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+        let interval = watchdog_usec
             .filter(|us| *us > 0)
             // Ping at a third of the deadline, not a half. A half leaves no
             // room for a tick that runs slightly long, and a missed ping is
@@ -113,9 +124,7 @@ mod tests {
     /// still work — silently.
     #[test]
     fn absent_environment_yields_an_inert_watchdog() {
-        std::env::remove_var("NOTIFY_SOCKET");
-        std::env::remove_var("WATCHDOG_USEC");
-        let w = Watchdog::from_env();
+        let w = Watchdog::from_parts(None, None);
         assert!(!w.is_active());
         assert_eq!(w.interval(), None);
         // Must not panic.
@@ -128,34 +137,43 @@ mod tests {
     /// this wrong and every notification silently goes nowhere.
     #[test]
     fn abstract_sockets_are_nul_prefixed() {
-        std::env::set_var("NOTIFY_SOCKET", "@/org/freedesktop/systemd1/notify");
-        let w = Watchdog::from_env();
+        let w = Watchdog::from_parts(Some("@/org/freedesktop/systemd1/notify".into()), None);
         let addr = w.addr.as_ref().unwrap().to_string_lossy().into_owned();
         assert!(addr.starts_with('\0'), "abstract socket must start with NUL");
-        std::env::remove_var("NOTIFY_SOCKET");
+    }
+
+    #[test]
+    fn ordinary_socket_paths_are_untouched() {
+        let w = Watchdog::from_parts(Some("/run/user/1000/systemd/notify".into()), None);
+        assert_eq!(
+            w.addr.as_ref().unwrap().to_string_lossy(),
+            "/run/user/1000/systemd/notify"
+        );
     }
 
     /// Pinging at half the deadline leaves no slack for a tick that runs
     /// long, and a missed ping is a SIGABRT. A third does.
     #[test]
     fn ping_interval_leaves_slack() {
-        std::env::set_var("NOTIFY_SOCKET", "/run/nowhere");
-        std::env::set_var("WATCHDOG_USEC", "300000000"); // 300s
-        let w = Watchdog::from_env();
+        let w = Watchdog::from_parts(Some("/run/nowhere".into()), Some(300_000_000));
         let iv = w.interval().unwrap();
         assert_eq!(iv, Duration::from_secs(100));
         assert!(iv < Duration::from_secs(150), "must be under half the deadline");
-        std::env::remove_var("NOTIFY_SOCKET");
-        std::env::remove_var("WATCHDOG_USEC");
     }
 
     #[test]
     fn zero_watchdog_usec_means_disabled() {
-        std::env::set_var("NOTIFY_SOCKET", "/run/nowhere");
-        std::env::set_var("WATCHDOG_USEC", "0");
-        let w = Watchdog::from_env();
+        let w = Watchdog::from_parts(Some("/run/nowhere".into()), Some(0));
         assert_eq!(w.interval(), None);
-        std::env::remove_var("NOTIFY_SOCKET");
-        std::env::remove_var("WATCHDOG_USEC");
+        assert!(!w.is_active());
+    }
+
+    /// A watchdog deadline with no socket to answer on is not active, and
+    /// pinging it must be a no-op rather than a panic.
+    #[test]
+    fn watchdog_without_a_socket_is_inert() {
+        let w = Watchdog::from_parts(None, Some(300_000_000));
+        assert!(!w.is_active());
+        w.ping();
     }
 }
