@@ -12,6 +12,7 @@
 //! The delegation target is installed as `pvpn-legacy`, NOT as `pvpn` -
 //! otherwise this binary would find itself and recurse.
 
+mod apps;
 mod connect;
 mod memory_cmd;
 
@@ -71,6 +72,13 @@ enum Cmd {
 
     /// What this network refused, and why.
     Blocked,
+
+    /// Flatpak apps that route around the tunnel.
+    Apps {
+        /// Put them back on the tunnel.
+        #[arg(long)]
+        fix: bool,
+    },
 
     /// What the daemon last published, verbatim.
     State,
@@ -177,6 +185,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Down => connect::cmd_down(&cfg).map(ExitCode::from),
         Cmd::Fast => memory_cmd::cmd_fast(&cfg, cli.json).map(ExitCode::from),
         Cmd::Blocked => memory_cmd::cmd_blocked(&cfg, cli.json).map(ExitCode::from),
+        Cmd::Apps { fix } => apps::cmd_apps(fix, cli.json).map(ExitCode::from),
         Cmd::Try => delegate("try", &[]),
         Cmd::Login { args } => delegate("login", &args),
         Cmd::Scan { args } => delegate("scan", &args),

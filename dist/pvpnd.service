@@ -5,6 +5,13 @@ Documentation=https://github.com/luohoa97/protun-unblocked
 # network going away and coming back, which is the whole point. It handles
 # being offline.
 PartOf=graphical-session.target
+# Never give up. The default (5 starts in 10s) cannot be hit at
+# RestartSec=10, but changing that value would silently reintroduce a
+# limit, and a VPN daemon that stops trying is useless.
+#
+# NB: StartLimit* are [Unit] directives. Putting them in [Service] makes
+# systemd log "Unknown key ... ignoring" and carry on without them.
+StartLimitIntervalSec=0
 
 [Service]
 # Type=exec, not notify: systemd considers the service started once exec
@@ -29,10 +36,6 @@ WatchdogSec=300
 
 Restart=always
 RestartSec=10
-# Never give up. The default (5 starts in 10s) cannot be hit with
-# RestartSec=10, but a future change to that value would silently
-# reintroduce a limit, and a VPN daemon that stops trying is useless.
-StartLimitIntervalSec=0
 
 # It shells out to pvpn, which drives NetworkManager over D-Bus as YOU.
 # Running as the user is required, not merely preferred: Proton keeps

@@ -26,7 +26,14 @@ if [ ! -x "$BIN" ]; then
 fi
 
 T="$(mktemp -d)"
-trap 'rm -rf "$T"' EXIT
+# Kill the whole process group's stragglers as well as removing the dir.
+# The fake gdbus sleeps for 600s after replaying its signals, so without
+# this every run leaks two processes that outlive the test by ten minutes.
+cleanup() {
+    pkill -f "$T/bin/gdbus" 2>/dev/null || true
+    rm -rf "$T"
+}
+trap cleanup EXIT INT TERM
 mkdir -p "$T/home/.config/pvpn" "$T/run" "$T/bin"
 
 # autoreconnect is OFF for the whole suite. This tests the signal path, and
