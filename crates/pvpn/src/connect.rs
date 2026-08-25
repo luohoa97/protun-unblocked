@@ -194,10 +194,18 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
             // bounce the wifi. It is the slowest thing on this path by an
             // order of magnitude, so it is timed separately - "took 12s"
             // usually means it was this, not the connect.
-            timing.mark("restore", || {
+            let recovered = timing.mark("restore", || {
                 proton::restore(Duration::from_secs(cfg.probe_timeout))
             });
-            std::thread::sleep(Duration::from_secs(2));
+            // The old flat 2-second settle is gone. restore() polls until
+            // traffic actually flows, so when it succeeds the routes are
+            // demonstrably back and there is nothing left to wait for -
+            // sleeping anyway just billed the user two seconds to prove
+            // something already proven. Only the failure case still gets a
+            // pause, and a shorter one.
+            if !recovered {
+                std::thread::sleep(Duration::from_millis(750));
+            }
         }
     }
 

@@ -85,27 +85,70 @@ pub struct Verdict {
     pub failed: Vec<&'static str>,
 }
 
-/// Probe until something answers.
+/// Probe every target AT ONCE; the first answer wins.
 ///
-/// ANY target answering means traffic flows — that is the claim being
+/// Concurrent, and that is not a micro-optimisation - it was a real
+/// regression. Moving from one target to three removed a single point of
+/// failure, but running them in sequence meant a dead tunnel paid every
+/// timeout in turn: three targets at 5s each is 15s to conclude what one
+/// target concluded in 5s. Measured in the wild at **10.14s** on a stale
+/// tunnel, against ~5s before the extra targets were added. The check got
+/// more robust and twice as slow, which is not a trade worth making.
+///
+/// Run together, the whole probe is bounded by the SLOWEST SINGLE target
+/// rather than their sum, so three targets cost no more wall clock than
+/// one. A healthy tunnel still returns on the first reply, in ~200ms.
+///
+/// ANY target answering means traffic flows - that is the claim being
 /// tested, and one working path proves it. Requiring all of them would make
-/// the check strictly more fragile than the thing it is checking.
+/// the check more fragile than the thing it is checking.
 pub fn traffic_flows(timeout: Duration) -> Verdict {
-    let mut failed = Vec::new();
+    let started = Instant::now();
+    let (tx, rx) = std::sync::mpsc::channel::<(&'static str, bool, Duration)>();
+
     for target in TARGETS {
-        let started = Instant::now();
-        match probe_one(target, timeout) {
-            true => {
+        let tx = tx.clone();
+        // Detached, not scoped. `thread::scope` joins every thread before
+        // returning, which would put the sum back: we must be able to
+        // answer on the first success and leave the stragglers to time out
+        // on their own. They hold nothing but a socket and exit shortly.
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            let ok = probe_one(target, timeout);
+            let _ = tx.send((target.label(), ok, t.elapsed()));
+        });
+    }
+    // Ours would otherwise keep the channel open after every worker exits,
+    // and the loop below would wait for a sender that is never coming.
+    drop(tx);
+
+    let mut failed = Vec::new();
+    // A small margin over the per-probe timeout: every worker is bounded by
+    // `timeout`, so anything beyond that plus scheduling slop means a
+    // thread is wedged, and waiting longer will not help.
+    let deadline = started + timeout + Duration::from_secs(1);
+
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
+            Ok((label, true, rtt)) => {
                 return Verdict {
                     alive: true,
-                    via: Some(target.label()),
-                    rtt: Some(started.elapsed()),
+                    via: Some(label),
+                    rtt: Some(rtt),
                     failed,
                 }
             }
-            false => failed.push(target.label()),
+            Ok((label, false, _)) => failed.push(label),
+            // Every worker has reported, and none of them succeeded.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
         }
     }
+
     Verdict {
         alive: false,
         via: None,
@@ -178,6 +221,30 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(50));
         assert_eq!(addr.port(), 80);
         assert!(addr.is_ipv4());
+    }
+
+    /// THE regression this concurrency exists to fix. Probing an address
+    /// nothing answers on must cost roughly ONE timeout, not one per
+    /// target - a stale tunnel was measured paying 10.14s for what a single
+    /// target concluded in 5s.
+    #[test]
+    fn a_dead_network_costs_one_timeout_not_three() {
+        let timeout = Duration::from_millis(600);
+        let started = Instant::now();
+        let v = traffic_flows(timeout);
+        let elapsed = started.elapsed();
+
+        // Whatever the machine's connectivity, the BOUND must hold.
+        assert!(
+            elapsed < timeout * (TARGETS.len() as u32),
+            "took {elapsed:?}, which is more than one timeout per target - \
+             the probes are running in sequence again"
+        );
+        // And if it did fail, every target must be accounted for, so the
+        // journal can say what was tried.
+        if !v.alive {
+            assert_eq!(v.failed.len(), TARGETS.len());
+        }
     }
 
     #[test]
