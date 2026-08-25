@@ -43,7 +43,17 @@ pub struct ServerRecord {
     pub block_strikes: u32,
     /// Why it was blocked, in words, for `pvpn blocked`.
     pub last_error: Option<String>,
-    /// Best observed time from "activate" to "connected", in ms.
+    /// Connects where the tunnel came up but traffic was never confirmed.
+    ///
+    /// Deliberately NOT counted as a failure on the first occurrence. Time
+    /// to first packet has been measured at 12s, >20s and >45s on hostile
+    /// networks, and every tunnel written off as dead turned out to be
+    /// alive shortly after. So one unverified connect means "unproven", not
+    /// "broken" - but a server that is repeatedly unprovable is not one to
+    /// keep choosing.
+    pub unverified: u32,
+
+    /// Best observed time from "activate" to VERIFIED, in ms.
     ///
     /// THE number that actually predicts what a connect will cost you here,
     /// and it is not the handshake latency. On a filtered network protun
@@ -149,6 +159,56 @@ pub struct NetworkMemory {
     pub updated: u64,
 }
 
+/// What OTHER sites on the same SSID have learned about a server.
+///
+/// WHY THIS EXISTS
+///
+/// A network id is `<ssid>-<hash(ssid|gateway-mac)>`, so it identifies a
+/// SITE: this SSID, behind this gateway. That is right for latency, which
+/// depends on where you physically are.
+///
+/// It is wrong for the blocked list. Blocking is a POLICY, and policy is
+/// set for an organisation, not a gateway. `detnsw` is a whole state
+/// education department: every school runs the same filter rules, but each
+/// building has its own gateway. Keyed by site alone, walking to another
+/// block throws away every blocked verdict and re-learns each one by
+/// failing on it again - 22 seconds a time, and a scan to go with it.
+///
+/// Keying policy purely by SSID would fix that and break something else:
+/// "eduroam" is thousands of unrelated networks, and pooling their verdicts
+/// would have one university's filter condemn servers at another.
+///
+/// So a sibling site's experience is treated as EVIDENCE, not as a verdict.
+/// A server the rest of this SSID refuses starts at a disadvantage and is
+/// tried later - but it is never excluded, so a genuinely different network
+/// sharing a name can still prove it works.
+#[derive(Debug, Clone, Default)]
+pub struct RealmPrior {
+    /// Sites on this SSID where the server is currently blocked.
+    pub refused_at: u32,
+    /// Sites on this SSID where it has connected successfully.
+    pub worked_at: u32,
+}
+
+impl RealmPrior {
+    /// Multiplier applied to a server's score. 1.0 is no opinion.
+    ///
+    /// Deliberately bounded. Sibling evidence is weaker than our own - it
+    /// came from a different gateway, possibly a different building - so it
+    /// can nudge the ordering and must never dominate it.
+    pub fn weight(&self) -> f64 {
+        if self.refused_at == 0 && self.worked_at == 0 {
+            return 1.0;
+        }
+        let total = (self.refused_at + self.worked_at) as f64;
+        let refused = self.refused_at as f64 / total;
+        // 0.8 when every sibling site connects fine, 1.6 when they all
+        // refuse. Enough to reorder a list, not enough to bury a server our
+        // own site has proven.
+        0.8 + 0.8 * refused
+    }
+}
+
 impl NetworkMemory {
     pub fn path_for(network: &str) -> std::path::PathBuf {
         paths::data_dir()
@@ -214,6 +274,24 @@ impl NetworkMemory {
         });
     }
 
+    /// The tunnel came up but nothing came through it in the time allowed.
+    ///
+    /// Blocks only on the second occurrence, for the reason on `unverified`:
+    /// one slow settle is normal here, two is a pattern.
+    pub fn record_unverified(&mut self, server: &str) -> bool {
+        let rec = self.entry(server);
+        rec.unverified = rec.unverified.saturating_add(1);
+        if rec.unverified >= 2 {
+            rec.failed += 1;
+            rec.blocked_at = Some(now_secs());
+            rec.block_strikes = rec.block_strikes.saturating_add(1);
+            rec.last_error = Some("tunnel came up but never carried traffic".into());
+            true
+        } else {
+            false
+        }
+    }
+
     /// Record that connecting to this server produced a working tunnel.
     ///
     /// Success clears the block outright, and resets the strike count. A
@@ -226,6 +304,8 @@ impl NetworkMemory {
         rec.blocked_at = None;
         rec.block_strikes = 0;
         rec.last_error = None;
+        // A proven connect clears the doubt too, not just the block.
+        rec.unverified = 0;
     }
 
     /// Record that connecting failed, and why.
@@ -237,6 +317,49 @@ impl NetworkMemory {
         rec.last_error = Some(why.into());
     }
 
+    /// Gather what other sites on the same SSID have learned.
+    ///
+    /// Sites share a filename prefix (`<ssid>-<hash>.json`), which is the
+    /// whole reason the readable prefix is in the id at all.
+    pub fn realm_priors(ssid: &str, this_network: &str, base_hours: u64)
+        -> BTreeMap<String, RealmPrior>
+    {
+        let mut priors: BTreeMap<String, RealmPrior> = BTreeMap::new();
+        let dir = paths::data_dir().join("networks");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return priors;
+        };
+        let prefix = format!("{}-", net::sanitise(ssid));
+        let now = now_secs();
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(&prefix) || !name.ends_with(".json") {
+                continue;
+            }
+            let network = name.trim_end_matches(".json");
+            // Our own site is not a prior; it is the evidence itself.
+            if network == net::sanitise(this_network) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(other) = serde_json::from_str::<Self>(&text) else {
+                continue;
+            };
+            for (server, rec) in &other.servers {
+                let p = priors.entry(server.clone()).or_default();
+                if rec.is_blocked(base_hours, now) {
+                    p.refused_at += 1;
+                } else if rec.ok > 0 {
+                    p.worked_at += 1;
+                }
+            }
+        }
+        priors
+    }
+
     /// Servers worth trying, best first.
     ///
     /// `candidates` is the list Proton says exists; this filters and orders
@@ -245,6 +368,16 @@ impl NetworkMemory {
     /// empty list — being offline is worse than trying something that
     /// failed yesterday.
     pub fn rank(&self, candidates: &[String], base_hours: u64) -> Vec<String> {
+        self.rank_with(candidates, base_hours, &BTreeMap::new())
+    }
+
+    /// `rank`, weighted by what sibling sites on this SSID have learned.
+    pub fn rank_with(
+        &self,
+        candidates: &[String],
+        base_hours: u64,
+        priors: &BTreeMap<String, RealmPrior>,
+    ) -> Vec<String> {
         let now = now_secs();
         let mut usable: Vec<&String> = candidates
             .iter()
@@ -264,11 +397,13 @@ impl NetworkMemory {
         }
 
         let score_of = |s: &String| {
-            self.servers
+            let base = self
+                .servers
                 .get(s)
                 .map(|r| r.score())
                 // Unknown server: same treatment as unmeasured.
-                .unwrap_or(10_000.0)
+                .unwrap_or(10_000.0);
+            base * priors.get(s).map(RealmPrior::weight).unwrap_or(1.0)
         };
         usable.sort_by(|a, b| {
             score_of(a)
@@ -532,6 +667,92 @@ mod tests {
         assert_eq!(m.confident_choices(24).len(), 1);
         m.record_failure("A", "refused");
         assert!(m.confident_choices(24).is_empty());
+    }
+
+    /// Sibling evidence must reorder, never overrule. A server the rest of
+    /// the SSID refuses should be tried LATER - but if this site has proven
+    /// it works, it must still be reachable, or an "eduroam" name collision
+    /// would let one network condemn servers on an unrelated one.
+    #[test]
+    fn sibling_evidence_reorders_but_does_not_exclude() {
+        let mut m = NetworkMemory::default();
+        m.record_latency("A", 100, false);
+        m.record_latency("B", 100, false);
+
+        let mut priors = BTreeMap::new();
+        priors.insert(
+            "A".to_string(),
+            RealmPrior {
+                refused_at: 3,
+                worked_at: 0,
+            },
+        );
+        priors.insert(
+            "B".to_string(),
+            RealmPrior {
+                refused_at: 0,
+                worked_at: 3,
+            },
+        );
+
+        let order = m.rank_with(&["A".into(), "B".into()], 24, &priors);
+        assert_eq!(order[0], "B", "the server siblings trust goes first");
+        assert_eq!(order.len(), 2, "the other one is still offered");
+    }
+
+    /// The weight is bounded on purpose: sibling evidence came from a
+    /// different gateway and is weaker than our own. It must be able to
+    /// nudge an ordering, not bury a server this site has proven.
+    #[test]
+    fn sibling_weight_is_bounded() {
+        let none = RealmPrior::default();
+        assert_eq!(none.weight(), 1.0, "no evidence means no opinion");
+
+        let all_bad = RealmPrior { refused_at: 99, worked_at: 0 };
+        let all_good = RealmPrior { refused_at: 0, worked_at: 99 };
+        assert!((all_bad.weight() - 1.6).abs() < 1e-9);
+        assert!((all_good.weight() - 0.8).abs() < 1e-9);
+
+        // Our own proven fast connect must still beat a slow server that
+        // siblings happen to like.
+        let mut proven_here = ServerRecord::default();
+        proven_here.connect_ms = Some(3_000);
+        proven_here.ok = 5;
+        let mut slow = ServerRecord::default();
+        slow.connect_ms = Some(20_000);
+        slow.ok = 5;
+        assert!(proven_here.score() * all_bad.weight() < slow.score() * all_good.weight());
+    }
+
+    /// One unverified connect is not evidence of a broken server - a slow
+    /// settle is normal on these networks. Two is a pattern.
+    #[test]
+    fn unverified_blocks_only_on_the_second_occurrence() {
+        let mut m = NetworkMemory::default();
+        assert!(!m.record_unverified("A"), "first must not block");
+        assert!(!m.servers["A"].is_blocked(24, now_secs()));
+
+        assert!(m.record_unverified("A"), "second must block");
+        assert!(m.servers["A"].is_blocked(24, now_secs()));
+        assert!(m.servers["A"]
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("never carried traffic"));
+    }
+
+    /// A server that later proves itself is fully rehabilitated - the doubt
+    /// clears with the block, or one bad afternoon would leave it one
+    /// wobble away from being blocked again forever.
+    #[test]
+    fn a_verified_connect_clears_previous_doubt() {
+        let mut m = NetworkMemory::default();
+        m.record_unverified("A");
+        assert_eq!(m.servers["A"].unverified, 1);
+
+        m.record_success("A");
+        assert_eq!(m.servers["A"].unverified, 0);
+        assert!(!m.servers["A"].is_blocked(24, now_secs()));
     }
 
     #[test]

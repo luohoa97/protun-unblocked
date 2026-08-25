@@ -50,9 +50,12 @@ pub struct UpArgs {
     pub hop: bool,
     pub rescan: bool,
     pub no_scan: bool,
-    /// Wait and confirm traffic before returning. Off by default: `up`
-    /// should return when the tunnel exists, and `pvpn status` answers
-    /// "is it carrying anything" in about 0.3s.
+    /// Confirm traffic actually flows before crediting the server.
+    ///
+    /// ON by default. It costs `verify_secs` on a tunnel that is slow to
+    /// settle, and it buys the only thing that makes the ranking
+    /// trustworthy: without it a server is credited for a tunnel that came
+    /// up carrying nothing.
     pub verify: bool,
     pub attempts: usize,
 }
@@ -67,7 +70,7 @@ impl Default for UpArgs {
             hop: false,
             rescan: false,
             no_scan: false,
-            verify: false,
+            verify: true,
             attempts: 3,
         }
     }
@@ -261,7 +264,22 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
             .collect()
     } else {
         let candidates = timing.mark("scan", || scan_candidates(cfg, &args, &network))?;
-        let ranked = memory.rank(&candidates, cfg.blocked_retry_after_hours);
+        // Weight by what other sites on this SSID have learned. On a
+        // department-wide network like a school, the filter policy is the
+        // same everywhere but each building has its own gateway - so a
+        // server refused in the next block is worth knowing about here.
+        let priors = match net::wifi_ssid() {
+            Some(ssid) => NetworkMemory::realm_priors(
+                &ssid,
+                &network,
+                cfg.blocked_retry_after_hours,
+            ),
+            None => Default::default(),
+        };
+        if !priors.is_empty() {
+            tracing::debug!(servers = priors.len(), "applying evidence from sibling sites");
+        }
+        let ranked = memory.rank_with(&candidates, cfg.blocked_retry_after_hours, &priors);
         ranked
             .into_iter()
             .filter(|t| !args.exclude.iter().any(|x| x == t))
@@ -332,14 +350,43 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
         match output {
             ConnectResult::Connected => {
                 let where_ = proton::current_server();
+
+                // Verification decides what we LEARN, which is the whole
+                // point of doing it. Before this, a server was credited the
+                // moment NetworkManager brought a tunnel up - and a tunnel
+                // that is up while carrying nothing is the exact failure
+                // this project exists to catch. The ranking was being
+                // taught by the thing it is supposed to detect.
+                let verified = if args.verify {
+                    print!("  confirming traffic...");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    let ok = timing.mark("verify", || {
+                        settled(cfg, Duration::from_secs(cfg.verify_secs))
+                    });
+                    println!("{}", if ok { " flowing." } else { " nothing yet." });
+                    Some(ok)
+                } else {
+                    None
+                };
+
                 let elapsed = started.elapsed();
-                if let Some(t) = target {
-                    memory.record_success(t);
-                    // The wall clock the user actually waited, which on a
-                    // filtered network is dominated by protun retrying a
-                    // refused entry IP on a 3s backoff - not by anything a
-                    // handshake measurement can see.
-                    memory.record_connect_time(t, elapsed.as_millis() as u64);
+                match (target, verified) {
+                    // Proven: credit it, and time it to VERIFIED rather
+                    // than to "tunnel exists", because that is when it
+                    // actually became usable.
+                    (Some(t), Some(true)) | (Some(t), None) => {
+                        memory.record_success(t);
+                        memory.record_connect_time(t, elapsed.as_millis() as u64);
+                    }
+                    // Came up, carried nothing. Not credited, and not
+                    // condemned on a single occurrence either.
+                    (Some(t), Some(false)) => {
+                        if memory.record_unverified(t) {
+                            eprintln!("  {t} has now failed to carry traffic twice here.");
+                            eprintln!("  Blocked for now; `pvpn up` will pick another.");
+                        }
+                    }
+                    (None, _) => {}
                 }
                 let _ = memory.save();
 
@@ -353,21 +400,21 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
                     );
                 }
 
-                if args.verify {
-                    print!("  checking traffic...");
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                    if settled(cfg) {
-                        println!(" flowing.");
-                    } else {
-                        println!();
-                        eprintln!(
-                            "No traffic yet after {}s. KEEPING the tunnel: in testing",
-                            cfg.settle_secs
-                        );
-                        eprintln!("these have come good shortly afterwards.");
-                        eprintln!("  check with: pvpn status   |   give up with: pvpn down");
-                    }
+                if verified == Some(false) {
+                    // The tunnel is KEPT. Time to first packet has been
+                    // measured at 12s, >20s and >45s here, and every tunnel
+                    // written off as dead came good shortly after. Throwing
+                    // it away costs a full reconnect that often lands on
+                    // the same server.
+                    eprintln!();
+                    eprintln!(
+                        "No traffic within {}s. KEEPING the tunnel: these have come good",
+                        cfg.verify_secs
+                    );
+                    eprintln!("shortly afterwards in testing, and pvpnd will repair it if not.");
+                    eprintln!("  check with: pvpn status   |   give up with: pvpn down");
                 }
+
                 timing.report();
                 return Ok(0);
             }
@@ -534,13 +581,15 @@ fn first_useful_line(text: &str) -> Option<String> {
 
 /// Wait up to `settle_secs` for traffic, without ever tearing the tunnel
 /// down when it runs out.
-fn settled(cfg: &Config) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(cfg.settle_secs);
+fn settled(cfg: &Config, window: Duration) -> bool {
+    let deadline = Instant::now() + window;
     while Instant::now() < deadline {
         if probe::traffic_flows(Duration::from_secs(cfg.probe_timeout)).alive {
             return true;
         }
-        std::thread::sleep(Duration::from_secs(2));
+        // Poll briskly: this is the user waiting, and the probe itself
+        // already costs a round trip.
+        std::thread::sleep(Duration::from_millis(500));
     }
     false
 }

@@ -128,10 +128,14 @@ struct UpFlags {
     /// Skip measurement; let Proton choose.
     #[arg(long = "any", alias = "no-scan")]
     no_scan: bool,
-    /// Wait and confirm traffic before returning.
+    /// Confirm traffic before calling it connected. On by default.
     #[arg(long)]
     verify: bool,
-    /// Skip the traffic check (the default).
+    /// Return as soon as the tunnel exists, without confirming traffic.
+    ///
+    /// Faster, and it costs you the thing that makes the ranking worth
+    /// having: an unverified connect cannot tell a working server from one
+    /// whose tunnel comes up carrying nothing.
     #[arg(long, conflicts_with = "verify")]
     no_verify: bool,
     /// How many servers to try before giving up.
@@ -161,7 +165,10 @@ impl UpFlags {
             hop,
             rescan: self.rescan,
             no_scan: self.no_scan,
-            verify: self.verify && !self.no_verify,
+            // On unless explicitly waived. `--verify` stays accepted so
+            // existing scripts and muscle memory keep working, it is just
+            // the default now.
+            verify: !self.no_verify,
             attempts: self.attempts.clamp(1, 10),
         }
     }
@@ -398,13 +405,25 @@ mod tests {
         assert_eq!(UpFlags::default().filter(), None);
     }
 
+    /// Verification is ON by default now. Without it a server is credited
+    /// for a tunnel that may carry nothing, which teaches the ranking the
+    /// exact failure it is supposed to detect.
     #[test]
-    fn no_verify_beats_verify_default() {
-        let f = UpFlags {
+    fn verification_is_on_by_default_and_waivable() {
+        assert!(UpFlags::default().into_args(false).verify);
+
+        let waived = UpFlags {
             no_verify: true,
             ..Default::default()
         };
-        assert!(!f.into_args(false).verify);
+        assert!(!waived.into_args(false).verify);
+
+        // --verify remains accepted so existing scripts do not break.
+        let explicit = UpFlags {
+            verify: true,
+            ..Default::default()
+        };
+        assert!(explicit.into_args(false).verify);
     }
 
     #[test]

@@ -65,6 +65,24 @@ pub struct Config {
     /// debugging the network itself.
     pub autoreconnect: bool,
 
+    /// Confirm traffic actually flows before calling a connect a success.
+    ///
+    /// ON by default. Without it, "connected" means only that
+    /// NetworkManager brought a tunnel up - which is exactly the state this
+    /// whole project exists to catch, because protun keeps a tunnel
+    /// "activated" while carrying nothing. Crediting a server for that
+    /// teaches the ranking the wrong thing.
+    pub verify: bool,
+
+    /// Seconds to wait for first traffic before calling a connect
+    /// unproven.
+    ///
+    /// NOT settle_secs. That is 90 and governs when to give up on a tunnel
+    /// entirely; running out of it never tears one down. This is the much
+    /// shorter window for deciding whether to CREDIT the server, so a
+    /// connect does not sit for a minute and a half before returning.
+    pub verify_secs: u64,
+
     /// How many proven servers this network needs before `pvpn up` stops
     /// measuring and just uses what it learned.
     ///
@@ -94,6 +112,8 @@ impl Default for Config {
             autoreconnect: true,
             reconnect_timeout: 120,
             trust_after_servers: 3,
+            verify: true,
+            verify_secs: 20,
         }
     }
 }
@@ -166,6 +186,8 @@ impl Config {
             "autoreconnect" => self.autoreconnect = truthy(value, self.autoreconnect),
             "reconnect_timeout" => num(value, &mut self.reconnect_timeout),
             "trust_after_servers" => num(value, &mut self.trust_after_servers),
+            "verify" => self.verify = truthy(value, self.verify),
+            "verify_secs" => num(value, &mut self.verify_secs),
             // Unknown keys are ignored, not rejected. Old installs carry
             // settings from removed features, and refusing to load over one
             // of them would be a worse failure than ignoring it.
@@ -188,6 +210,9 @@ impl Config {
                 self.country = Some(v);
             }
         }
+        if let Ok(v) = std::env::var("PVPN_VERIFY") {
+            self.verify = truthy(&v, self.verify);
+        }
         if let Ok(v) = std::env::var("PVPN_FIX_APPS") {
             self.fix_apps = truthy(&v, self.fix_apps);
         }
@@ -204,6 +229,7 @@ impl Config {
         self.strikes = self.strikes.clamp(1, 20);
         self.reconnect_timeout = self.reconnect_timeout.clamp(30, 900);
         self.trust_after_servers = self.trust_after_servers.min(20);
+        self.verify_secs = self.verify_secs.clamp(3, 120);
         self.connect_timeout_secs = self.connect_timeout_secs.clamp(5, 600);
         self.settle_secs = self.settle_secs.clamp(0, 600);
     }
