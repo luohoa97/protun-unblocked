@@ -14,3 +14,4 @@ tracing.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
 native-tls.workspace = true
+zbus.workspace = true

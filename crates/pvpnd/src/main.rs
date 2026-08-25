@@ -401,63 +401,89 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
 
 /// Watch NetworkManager's D-Bus signals forever, forwarding events.
 ///
+/// Native D-Bus, not a `gdbus monitor` subprocess. The subprocess worked,
+/// but it meant a child process for the life of the daemon, text to parse,
+/// and a restart loop to supervise. Signals now arrive on a socket this
+/// process already holds, and the values arrive as `u32` rather than as
+/// text that could be misread.
+///
 /// Unprivileged: receiving NM's broadcast signals needs no root. That was
 /// verified on a real machine, not assumed - an earlier version of this
 /// comment claimed the opposite based on a "No such file or directory"
 /// error that was really an unset DBUS_SYSTEM_BUS_ADDRESS.
 fn spawn_nm_watcher(tx: Sender<nm::Ev>) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        // Escalating, so a machine with no gdbus at all does not write a
-        // log line every five seconds forever.
-        let mut retry = Duration::from_secs(5);
+        // Replay mode, for tests/adversarial-replay.sh. Reading recorded
+        // signal lines from a file is how the daemon is driven through
+        // scenarios that are impractical to provoke for real - a wifi
+        // re-activating at the exact moment a tunnel is torn down, for
+        // one. Never set in normal operation.
+        if let Ok(path) = std::env::var("PVPND_REPLAY") {
+            replay_from_file(&path, &tx);
+            return;
+        }
 
+        let mut retry = Duration::from_secs(5);
         loop {
-            // Re-seeded per gdbus session, so a NetworkManager restart
-            // cannot leave us holding stale object paths.
             let mut tunnels = nm::TunnelPaths::seeded();
             tracing::debug!(known_tunnels = tunnels.len(), "nm watcher attaching");
 
-            let child = std::process::Command::new("gdbus")
-                .args([
-                    "monitor",
-                    "--system",
-                    "--dest",
-                    "org.freedesktop.NetworkManager",
-                ])
-                .env("DBUS_SYSTEM_BUS_ADDRESS", nm::dbus_addr())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn();
+            let result = pvpn_core::dbus::watch_state_changes(|path, vpn_specific, state, reason| {
+                let Some(sig) = nm::signal_from_raw(path, vpn_specific, state, reason) else {
+                    return;
+                };
+                let Some(ev) = tunnels.classify(sig) else {
+                    return;
+                };
+                let _ = tx.send(ev);
+            });
 
-            match child {
-                Ok(mut c) => {
-                    retry = Duration::from_secs(5);
-                    if let Some(out) = c.stdout.take() {
-                        use std::io::BufRead;
-                        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
-                            let Some(sig) = nm::parse_signal(&line) else {
-                                continue;
-                            };
-                            let Some(ev) = tunnels.classify(sig) else {
-                                continue;
-                            };
-                            if tx.send(ev).is_err() {
-                                return; // main loop is gone
-                            }
-                        }
-                    }
-                    let _ = c.wait();
-                    tracing::warn!("nm watcher: gdbus exited, restarting");
-                }
+            match result {
+                Ok(()) => retry = Duration::from_secs(5),
                 Err(e) => {
-                    tracing::error!(error = %e, retry_secs = retry.as_secs(), "cannot start gdbus");
+                    tracing::error!(error = %e, retry_secs = retry.as_secs(), "nm watcher stopped");
+                    // Escalating, so a machine with no system bus at all
+                    // does not write a log line every five seconds forever.
                     retry = (retry * 2).min(Duration::from_secs(300));
                 }
             }
-            // NM restarting takes its monitor down with it; never spin.
+            // NM restarting takes its signals with it; never spin on it.
             std::thread::sleep(retry);
         }
     })
+}
+
+/// Drive the daemon from a file of recorded signal lines.
+///
+/// The lines are exactly what `gdbus monitor` printed, so recordings taken
+/// from a real machine before the switch to native D-Bus still replay.
+fn replay_from_file(path: &str, tx: &Sender<nm::Ev>) {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        tracing::error!(path, "PVPND_REPLAY file is unreadable");
+        return;
+    };
+    tracing::warn!(path, "REPLAY MODE - signals are coming from a file, not NetworkManager");
+    let mut tunnels = nm::TunnelPaths::seeded();
+    // A beat before the first line, so the main loop has published its
+    // starting state and a scenario's first tick is not a race.
+    std::thread::sleep(Duration::from_secs(1));
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        let Some(sig) = nm::parse_signal(&line) else {
+            continue;
+        };
+        let Some(ev) = tunnels.classify(sig) else {
+            continue;
+        };
+        if tx.send(ev).is_err() {
+            return;
+        }
+    }
+    // Hold the thread so the supervisor does not see the watcher "die" and
+    // respawn it mid-scenario.
+    loop {
+        std::thread::sleep(Duration::from_secs(60));
+    }
 }
 
 #[cfg(test)]

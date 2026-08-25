@@ -14,7 +14,14 @@
 use std::process::Command;
 
 /// The active wifi SSID, or `None` on wired/unknown.
+///
+/// D-Bus first, `nmcli` only if the bus is unreachable. Same reasoning as
+/// everywhere else here: nmcli is a text layer over these exact calls and
+/// costs ~45ms of process startup to produce them.
 pub fn wifi_ssid() -> Option<String> {
+    if let Some(s) = crate::dbus::wifi_ssid() {
+        return Some(s);
+    }
     let out = Command::new("nmcli")
         .args(["-t", "-f", "ACTIVE,SSID", "device", "wifi"])
         .output()
@@ -29,44 +36,59 @@ pub fn wifi_ssid() -> Option<String> {
     None
 }
 
-/// The IPv4 default gateway.
+/// The IPv4 default gateway, from `/proc/net/route`.
+///
+/// Read rather than shelled out to. `ip route` costs a fork+exec for four
+/// bytes that the kernel already exposes as a file, and this runs on every
+/// `pvpn` invocation.
+///
+/// The format is fixed-width hex, little-endian, one route per line:
+///     Iface  Destination  Gateway   Flags  ...
+///     wlan0  00000000     0101A8C0  0003   ...
+/// A destination of 00000000 is the default route.
 pub fn default_gateway() -> Option<String> {
-    let out = Command::new("ip")
-        .args(["-4", "route", "show", "default"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    // "default via 192.168.1.1 dev wlan0 ..." - take the word after "via"
-    // rather than a fixed field, because the format grows options over time.
-    let mut words = text.split_whitespace();
-    while let Some(w) = words.next() {
-        if w == "via" {
-            return words.next().map(|s| s.to_string());
+    let text = std::fs::read_to_string("/proc/net/route").ok()?;
+    for line in text.lines().skip(1) {
+        let mut f = line.split_whitespace();
+        let _iface = f.next()?;
+        let dest = f.next()?;
+        let gw = f.next()?;
+        if dest != "00000000" || gw == "00000000" {
+            continue;
         }
+        return hex_le_to_ipv4(gw);
     }
     None
 }
 
-/// The gateway's MAC, pinging once if the neighbour table does not know it
-/// yet. `ip neigh` only learns a gateway after something has talked to it,
-/// so on a fresh connection the first lookup is empty.
-pub fn gateway_mac(gw: &str) -> Option<String> {
-    if let Some(mac) = neigh_lookup(gw) {
-        return Some(mac);
-    }
-    let _ = Command::new("ping")
-        .args(["-c1", "-W1", gw])
-        .output();
-    neigh_lookup(gw)
+/// `0101A8C0` -> `192.168.1.1`. Little-endian, as the kernel writes it.
+fn hex_le_to_ipv4(hex: &str) -> Option<String> {
+    let n = u32::from_str_radix(hex, 16).ok()?;
+    let b = n.to_le_bytes();
+    Some(format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]))
 }
 
-fn neigh_lookup(gw: &str) -> Option<String> {
-    let out = Command::new("ip").args(["neigh", "show", gw]).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut words = text.split_whitespace();
-    while let Some(w) = words.next() {
-        if w == "lladdr" {
-            return words.next().map(|s| s.to_string());
+/// The gateway's MAC, from `/proc/net/arp`.
+///
+/// No ping fallback. The old implementation ran `ping -c1 -W1` when the
+/// neighbour table had no entry, which costs a full second on a gateway
+/// that does not answer ICMP - a second added to every `pvpn` command, to
+/// refine a cache key. If the MAC is unknown the gateway IP is used
+/// instead, which is stable enough and free.
+pub fn gateway_mac(gw: &str) -> Option<String> {
+    let text = std::fs::read_to_string("/proc/net/arp").ok()?;
+    for line in text.lines().skip(1) {
+        let mut f = line.split_whitespace();
+        let ip = f.next()?;
+        if ip != gw {
+            continue;
+        }
+        let _hw_type = f.next()?;
+        let _flags = f.next()?;
+        let mac = f.next()?;
+        // 00:00:00:00:00:00 means "known to be unknown".
+        if mac != "00:00:00:00:00:00" {
+            return Some(mac.to_string());
         }
     }
     None
@@ -180,6 +202,25 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(h, String::from_utf8_lossy(&expected.stdout).trim());
+    }
+
+    /// The kernel writes the gateway little-endian. Getting the byte order
+    /// wrong yields a plausible-looking but wrong address, which would
+    /// silently split one network's memory across two cache keys.
+    #[test]
+    fn kernel_route_hex_decodes_little_endian() {
+        assert_eq!(hex_le_to_ipv4("0101A8C0").as_deref(), Some("192.168.1.1"));
+        assert_eq!(hex_le_to_ipv4("FE01A8C0").as_deref(), Some("192.168.1.254"));
+        assert_eq!(hex_le_to_ipv4("00000000").as_deref(), Some("0.0.0.0"));
+        assert_eq!(hex_le_to_ipv4("nonsense"), None);
+    }
+
+    /// Reading the real files must never panic, whatever they contain.
+    #[test]
+    fn proc_readers_are_safe() {
+        let _ = default_gateway();
+        let _ = gateway_mac("192.168.1.1");
+        let _ = gateway_mac("not-an-ip");
     }
 
     #[test]

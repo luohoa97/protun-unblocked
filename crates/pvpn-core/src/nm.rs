@@ -88,6 +88,54 @@ pub fn parse_state_reason(line: &str, marker: &str) -> Option<(u32, u32)> {
     None
 }
 
+/// What a `(state, reason)` pair means, given which interface carried it.
+///
+/// THE decision this project keeps getting wrong, so it lives in exactly
+/// one place and both the D-Bus path and the replay parser go through it.
+///
+///   VPN.Connection.VpnStateChanged      protun / OpenVPN.  5=ACTIVATED,
+///                                       6=FAILED, 7=DISCONNECTED
+///   Connection.Active.StateChanged      WireGuard.         2=ACTIVATED,
+///                                       4=DEACTIVATED
+///
+/// They do NOT share a state enum, which is why the interface has to be
+/// known before the numbers mean anything.
+pub fn event_for(vpn_specific: bool, state: u32, reason: u32) -> Option<Ev> {
+    let (activated, gone): (u32, &[u32]) = if vpn_specific {
+        (5, &[6, 7])
+    } else {
+        (2, &[4])
+    };
+    if state == activated {
+        return Some(Ev::Activated);
+    }
+    if gone.contains(&state) {
+        return Some(
+            if reason == REASON_USER_DISCONNECTED || reason == REASON_CONNECTION_REMOVED {
+                Ev::WentDownDeliberately
+            } else {
+                Ev::Failed
+            },
+        );
+    }
+    None
+}
+
+/// Build a signal from raw D-Bus values.
+pub fn signal_from_raw(path: &str, vpn_specific: bool, state: u32, reason: u32) -> Option<Sig> {
+    let ev = event_for(vpn_specific, state, reason)?;
+    if vpn_specific {
+        return Some(Sig::Vpn(ev));
+    }
+    if !path.starts_with(AC_PREFIX) {
+        return None;
+    }
+    Some(Sig::Generic {
+        path: path.to_string(),
+        ev,
+    })
+}
+
 /// Turn one line of gdbus output into a signal, if it is one we can read.
 ///
 /// Two interfaces, because NetworkManager models the two tunnel kinds
@@ -98,42 +146,23 @@ pub fn parse_state_reason(line: &str, marker: &str) -> Option<(u32, u32)> {
 ///   Connection.Active.StateChanged      WireGuard.         2=ACTIVATED,
 ///                                       4=DEACTIVATED
 pub fn parse_signal(line: &str) -> Option<Sig> {
-    let generic = if line.contains(".VPN.Connection.VpnStateChanged") {
-        false
-    } else if line.contains(".Connection.Active.StateChanged") {
+    let vpn_specific = if line.contains(".VPN.Connection.VpnStateChanged") {
         true
+    } else if line.contains(".Connection.Active.StateChanged") {
+        false
     } else {
         return None;
     };
-
-    let (activated, gone, (state, reason)) = if generic {
-        (2u32, [4u32, 4u32], parse_state_reason(line, "StateChanged")?)
+    let marker = if vpn_specific {
+        "VpnStateChanged"
     } else {
-        (5u32, [6u32, 7u32], parse_state_reason(line, "VpnStateChanged")?)
+        "StateChanged"
     };
-
-    let ev = if state == activated {
-        Ev::Activated
-    } else if gone.contains(&state) {
-        if reason == REASON_USER_DISCONNECTED || reason == REASON_CONNECTION_REMOVED {
-            Ev::WentDownDeliberately
-        } else {
-            Ev::Failed
-        }
-    } else {
-        return None;
-    };
-
-    if !generic {
-        return Some(Sig::Vpn(ev));
-    }
+    let (state, reason) = parse_state_reason(line, marker)?;
     // "/org/.../ActiveConnection/9: org.freedesktop..." - the sender is
     // everything before the first ": ".
-    let path = line.split_once(": ")?.0.trim().to_string();
-    if !path.starts_with(AC_PREFIX) {
-        return None;
-    }
-    Some(Sig::Generic { path, ev })
+    let path = line.split_once(": ").map(|(p, _)| p.trim()).unwrap_or("");
+    signal_from_raw(path, vpn_specific, state, reason)
 }
 
 /// The system bus address. A systemd *user* service does not inherit it,
@@ -196,6 +225,14 @@ impl TunnelPaths {
     /// before the daemon started is still recognised when it goes away.
     pub fn seeded() -> Self {
         let mut set = HashSet::new();
+        if crate::dbus::available() {
+            for (path, kind, _) in crate::dbus::active_connections() {
+                if kind == "vpn" || kind == "wireguard" {
+                    set.insert(path);
+                }
+            }
+            return Self(set);
+        }
         let Some(raw) = get_property(
             "/org/freedesktop/NetworkManager",
             "org.freedesktop.NetworkManager",
@@ -268,6 +305,9 @@ impl TunnelPaths {
 /// definition. We are identifying something that is present, not guessing
 /// whether something is still there.
 pub fn is_tunnel_path(path: &str) -> bool {
+    if crate::dbus::available() {
+        return crate::dbus::is_tunnel_path(path);
+    }
     let Some(raw) = get_property(
         path,
         "org.freedesktop.NetworkManager.Connection.Active",
@@ -291,6 +331,20 @@ pub fn is_tunnel_path(path: &str) -> bool {
 /// Any active vpn/wireguard profile counts, not just ones named
 /// "ProtonVPN": hopping leaves profiles named after bare server IPs.
 pub fn vpn_connection() -> Option<String> {
+    // D-Bus first: ~7ms against ~45ms for nmcli, and NetworkManager is the
+    // authority either way - nmcli is a text-formatting layer over these
+    // same calls.
+    if crate::dbus::available() {
+        return crate::dbus::vpn_connection();
+    }
+    vpn_connection_via_nmcli()
+}
+
+/// The `nmcli` path, kept as a fallback for when the system bus is not
+/// reachable - early boot, or a container without it. Slower, but the
+/// alternative is answering "no tunnel" when there is one, and the daemon
+/// would then reconnect a perfectly good connection.
+pub fn vpn_connection_via_nmcli() -> Option<String> {
     let out = Command::new("nmcli")
         .args(["-t", "-f", "NAME,TYPE", "connection", "show", "--active"])
         .output()

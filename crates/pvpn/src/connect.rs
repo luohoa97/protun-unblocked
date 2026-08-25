@@ -27,12 +27,22 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use pvpn_core::{
     config::Config,
+    dbus,
     intent::{self, BusyGuard},
     learn::NetworkMemory,
     net, paths, probe, proton, Intent,
 };
 
 pub struct UpArgs {
+    /// Servers named outright with `-s/--server`.
+    ///
+    /// Kept apart from `filter` because naming a server is an ANSWER, not a
+    /// search: there is nothing to rank, and measuring a list of one just
+    /// to sort it costs a Python start plus two TLS handshakes for no
+    /// information. `pvpn up --server SG-FREE#20` used to print
+    /// "probing 1 servers, 2 samples each" before connecting to the only
+    /// candidate it had.
+    pub explicit: Vec<String>,
     pub filter: Option<String>,
     pub protocol: Option<String>,
     pub exclude: Vec<String>,
@@ -50,6 +60,7 @@ pub struct UpArgs {
 impl Default for UpArgs {
     fn default() -> Self {
         Self {
+            explicit: Vec::new(),
             filter: None,
             protocol: None,
             exclude: Vec::new(),
@@ -85,8 +96,66 @@ pub fn cmd_down(cfg: &Config) -> Result<u8> {
     }
 }
 
+/// Where the wall clock went.
+///
+/// Printed after every connect, not hidden behind a flag. "Why did that
+/// take twelve seconds" is the single most common question about this
+/// tool, and answering it should not require re-running with -v or asking
+/// someone to read the source.
+#[derive(Default)]
+struct Timing {
+    phases: Vec<(&'static str, Duration)>,
+    started: Option<Instant>,
+}
+
+impl Timing {
+    fn new() -> Self {
+        Self {
+            phases: Vec::new(),
+            started: Some(Instant::now()),
+        }
+    }
+
+    fn mark<T>(&mut self, name: &'static str, f: impl FnOnce() -> T) -> T {
+        let t = Instant::now();
+        let v = f();
+        self.phases.push((name, t.elapsed()));
+        v
+    }
+
+    fn record(&mut self, name: &'static str, d: Duration) {
+        self.phases.push((name, d));
+    }
+
+    fn report(&self) {
+        let total = self.started.map(|s| s.elapsed()).unwrap_or_default();
+        // Only the parts worth looking at. Sub-5ms phases are noise and
+        // burying the slow one in a list of them helps nobody.
+        let interesting: Vec<_> = self
+            .phases
+            .iter()
+            .filter(|(_, d)| *d >= Duration::from_millis(5))
+            .collect();
+        eprintln!();
+        eprint!("  took {:.2}s", total.as_secs_f64());
+        if interesting.is_empty() {
+            eprintln!();
+            return;
+        }
+        eprintln!(
+            "  ({})",
+            interesting
+                .iter()
+                .map(|(n, d)| format!("{n} {:.2}s", d.as_secs_f64()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
 pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
     let _busy = BusyGuard::acquire();
+    let mut timing = Timing::new();
 
     if args.hop {
         match proton::current_server() {
@@ -100,22 +169,34 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
 
     let switching = args.hop || !args.exclude.is_empty();
 
-    if proton::is_connected() {
+    if timing.mark("check-connected", proton::is_connected) {
         if switching {
             // Switching does NOT need a disconnect first: `protonvpn
             // connect` replaces the tunnel in place. Tearing down first
             // would drop you to the bare network in between — slower, and a
             // moment of unprotected traffic.
             println!("Switching server without disconnecting first.");
-        } else if probe::traffic_flows(Duration::from_secs(cfg.probe_timeout)).alive {
+        } else if timing
+            .mark("probe", || {
+                probe::traffic_flows(Duration::from_secs(cfg.probe_timeout))
+            })
+            .alive
+        {
             println!("Already connected.");
+            timing.report();
             return Ok(0);
         } else {
             // Claims connected, nothing passes. The post-resume case:
             // protun's reconnect probes UDP, which this network blocks, so
             // it cannot recover on its own.
             eprintln!("Connected, but no traffic is passing - stale tunnel. Rebuilding...");
-            proton::restore(Duration::from_secs(cfg.probe_timeout));
+            // restore() waits up to 10s for traffic to come back, then can
+            // bounce the wifi. It is the slowest thing on this path by an
+            // order of magnitude, so it is timed separately - "took 12s"
+            // usually means it was this, not the connect.
+            timing.mark("restore", || {
+                proton::restore(Duration::from_secs(cfg.probe_timeout))
+            });
             std::thread::sleep(Duration::from_secs(2));
         }
     }
@@ -138,13 +219,16 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
 
     intent::write(Intent::Up).context("recording intent")?;
 
-    let network = net::network_id();
+    let network = timing.mark("network-id", net::network_id);
     let mut memory = NetworkMemory::load(&network);
 
-    let targets = if args.no_scan {
+    let targets = if !args.explicit.is_empty() {
+        // Named outright: nothing to measure, nothing to choose.
+        args.explicit.clone()
+    } else if args.no_scan {
         Vec::new()
     } else {
-        let candidates = scan_candidates(cfg, &args, &network)?;
+        let candidates = timing.mark("scan", || scan_candidates(cfg, &args, &network))?;
         let ranked = memory.rank(&candidates, cfg.blocked_retry_after_hours);
         ranked
             .into_iter()
@@ -196,7 +280,22 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
         }
 
         let started = Instant::now();
-        let output = run_connect(cfg, target.map(|s| s.as_str()));
+
+        // Fast path first: a saved NM profile means no Python at all.
+        let fast = target.and_then(|t| fast_activate(cfg, t));
+        let via_fast_path = fast.is_some();
+        let output = match fast {
+            Some(r) => {
+                timing.record("activate", started.elapsed());
+                r
+            }
+            None => {
+                let t = Instant::now();
+                let r = run_connect(cfg, target.map(|s| s.as_str()));
+                timing.record("protonvpn-connect", t.elapsed());
+                r
+            }
+        };
 
         match output {
             ConnectResult::Connected => {
@@ -208,8 +307,13 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
                 let _ = memory.save();
 
                 match &where_ {
-                    Some(s) => println!("Connected to {s} via {proto} in {:.0}s.", elapsed.as_secs_f64()),
-                    None => println!("Connected via {proto} in {:.0}s.", elapsed.as_secs_f64()),
+                    Some(s) => println!("Connected to {s} via {proto} in {:.1}s.", elapsed.as_secs_f64()),
+                    None => println!("Connected via {proto} in {:.1}s.", elapsed.as_secs_f64()),
+                }
+                if !via_fast_path {
+                    println!(
+                        "  (first connect to this server - the next one skips Proton's client)"
+                    );
                 }
 
                 if args.verify {
@@ -227,6 +331,7 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
                         eprintln!("  check with: pvpn status   |   give up with: pvpn down");
                     }
                 }
+                timing.report();
                 return Ok(0);
             }
             ConnectResult::Failed { detail, kind } => {
@@ -247,6 +352,7 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
     }
 
     let _ = memory.save();
+    timing.report();
     eprintln!("Restoring your normal connection...");
     if proton::restore(Duration::from_secs(cfg.probe_timeout)) {
         eprintln!("Internet restored.");
@@ -254,6 +360,63 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
         eprintln!("Internet still down - try: pvpn down");
     }
     Ok(1)
+}
+
+/// Bring up a server we have connected to before, without Proton's client.
+///
+/// THE reason `pvpn up` stopped taking tens of seconds.
+///
+/// Proton's client does not build the tunnel itself - it writes a
+/// NetworkManager profile and asks NM to activate it, and those profiles
+/// persist. So for any server already used once, the whole Python stack is
+/// unnecessary: `protonvpn connect` costs ~10s, of which 2.0s is the
+/// interpreter starting before it does anything, while NM's
+/// ActivateConnection is a single method call.
+///
+/// Returns `None` when there is no saved profile, which is not a failure -
+/// it means "this server is new here, go the long way once".
+fn fast_activate(cfg: &Config, server: &str) -> Option<ConnectResult> {
+    let profile = dbus::find_tunnel_profile(server)?;
+    tracing::debug!(id = %profile.id, uuid = %profile.uuid, "found a saved profile");
+
+    // Switching tunnels: NM will not sensibly run two at once, and leaving
+    // the old one up makes the new activation fail rather than replace it.
+    if let Some(active) = dbus::active_tunnel_path() {
+        if dbus::connection_id(&active).as_deref() != Some(profile.id.as_str()) {
+            let _ = dbus::deactivate(&active);
+        } else {
+            // Already on exactly this server.
+            return Some(ConnectResult::Connected);
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let active = match dbus::activate(&profile) {
+        Ok(p) => p,
+        Err(e) => {
+            // Fall back rather than fail: a profile that NM refuses to
+            // activate (stale credentials, changed plugin) is exactly what
+            // the slow path exists to rebuild.
+            tracing::warn!(error = %e, "direct activation refused; falling back to the client");
+            return None;
+        }
+    };
+    tracing::debug!(?active, "activation accepted in {:?}", started.elapsed());
+
+    match dbus::await_activation(&active, Duration::from_secs(cfg.connect_timeout_secs)) {
+        r if r.ok() => Some(ConnectResult::Connected),
+        pvpn_core::dbus::ActivationResult::TimedOut => Some(ConnectResult::Failed {
+            detail: format!("timed out after {}s", cfg.connect_timeout_secs),
+            kind: proton::Failure::Retryable,
+        }),
+        other => {
+            // NM tried and refused. That can mean stale credentials, which
+            // the client CAN fix, so hand it over rather than reporting a
+            // dead server.
+            tracing::warn!(?other, "saved profile failed; falling back to the client");
+            None
+        }
+    }
 }
 
 enum ConnectResult {

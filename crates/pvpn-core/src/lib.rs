@@ -23,6 +23,7 @@
 //! implementation of reading and writing it - this one.
 
 pub mod config;
+pub mod dbus;
 pub mod intent;
 pub mod learn;
 pub mod net;

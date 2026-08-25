@@ -12,9 +12,16 @@
 # Every scenario below is either a bug that reached a user, or a case that
 # would have become one. Named so a failure says which.
 #
-# Offline and destructive to nothing: gdbus, nmcli and pvpn are all replaced
-# by fakes, HOME and XDG_RUNTIME_DIR point into a temp dir, and no real
-# tunnel is touched. Safe to run with the VPN up.
+# Offline and destructive to nothing. Isolation has three parts, and all
+# three matter:
+#
+#   1. DBUS_SYSTEM_BUS_ADDRESS points at nothing, so the daemon cannot see
+#      the REAL NetworkManager. Without this it would read the live tunnel
+#      and every scenario would be measuring the machine, not the code.
+#   2. Signals come from PVPND_REPLAY, a file of recorded gdbus lines.
+#   3. nmcli and pvpn are fakes; HOME and XDG_RUNTIME_DIR are a temp dir.
+#
+# Safe to run with the VPN up. It cannot reach it.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,14 +33,7 @@ if [ ! -x "$BIN" ]; then
 fi
 
 T="$(mktemp -d)"
-# Kill the whole process group's stragglers as well as removing the dir.
-# The fake gdbus sleeps for 600s after replaying its signals, so without
-# this every run leaks two processes that outlive the test by ten minutes.
-cleanup() {
-    pkill -f "$T/bin/gdbus" 2>/dev/null || true
-    rm -rf "$T"
-}
-trap cleanup EXIT INT TERM
+trap 'rm -rf "$T"' EXIT INT TERM
 mkdir -p "$T/home/.config/pvpn" "$T/run" "$T/bin"
 
 # autoreconnect is OFF for the whole suite. This tests the signal path, and
@@ -46,21 +46,19 @@ strikes=1
 autoreconnect=off
 EOF
 
-# Fake NetworkManager over gdbus. Object 303 is wifi, 9 is a wireguard
-# tunnel — the same topology as the machine the regression was found on.
+# The daemon falls back to gdbus for property reads when D-Bus is
+# unreachable, which it is here by design. Object 303 is wifi, 9 is a
+# wireguard tunnel — the same topology as the machine the regression was
+# found on.
 cat > "$T/bin/gdbus" <<'EOF'
 #!/usr/bin/env bash
-mode=$1
-if [ "$mode" = call ]; then
-  case "$*" in
-    *ActiveConnections*) echo "(<[objectpath '/org/freedesktop/NetworkManager/ActiveConnection/303']>,)" ;;
-    */ActiveConnection/303*Type*) echo "(<'802-11-wireless'>,)" ;;
-    */ActiveConnection/9*Type*)   echo "(<'wireguard'>,)" ;;
-    *) echo "(<''>,)" ;;
-  esac
-  exit 0
-fi
-[ "$mode" = monitor ] && { sleep 1; cat "$FAKE_SIGNALS"; sleep 600; }
+[ "$1" = call ] || exit 1
+case "$*" in
+  *ActiveConnections*) echo "(<[objectpath '/org/freedesktop/NetworkManager/ActiveConnection/303']>,)" ;;
+  */ActiveConnection/303*Type*) echo "(<'802-11-wireless'>,)" ;;
+  */ActiveConnection/9*Type*)   echo "(<'wireguard'>,)" ;;
+  *) echo "(<''>,)" ;;
+esac
 EOF
 # No VPN, per nmcli. Keeps "is a tunnel up" out of the signal decision.
 printf '#!/usr/bin/env bash\nexit 0\n' > "$T/bin/nmcli"
@@ -81,7 +79,8 @@ run() {
     echo "$2" > "$T/home/.config/pvpn/intent"
     : > "$T/calls"
     env -i HOME="$T/home" XDG_RUNTIME_DIR="$T/run" PATH="$T/bin:/usr/bin:/bin" \
-        FAKE_SIGNALS="$3" PVPN_CALLS="$T/calls" "$BIN" > "$T/log-$1" 2>&1 &
+        DBUS_SYSTEM_BUS_ADDRESS="unix:path=$T/no-such-bus" \
+        PVPND_REPLAY="$3" PVPN_CALLS="$T/calls" "$BIN" > "$T/log-$1" 2>&1 &
     local pid=$!
     sleep 9
     kill $pid 2>/dev/null; wait $pid 2>/dev/null

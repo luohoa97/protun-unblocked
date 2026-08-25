@@ -110,6 +110,9 @@ struct UpFlags {
     #[arg(long = "city")]
     city: Vec<String>,
     /// Exact server name, e.g. JP-FREE#5. Repeatable.
+    ///
+    /// Naming a server skips measurement entirely - there is nothing to
+    /// rank - and takes the saved-profile fast path when one exists.
     #[arg(short = 's', long = "server")]
     server: Vec<String>,
 
@@ -144,12 +147,14 @@ impl UpFlags {
         parts.extend(self.pattern.clone());
         parts.extend(self.country.iter().cloned());
         parts.extend(self.city.iter().cloned());
-        parts.extend(self.server.iter().cloned());
+        // `server` is deliberately NOT folded in here: it is an answer, not
+        // a search term, and it travels as `explicit` instead.
         (!parts.is_empty()).then(|| parts.join(","))
     }
 
     fn into_args(self, hop: bool) -> connect::UpArgs {
         connect::UpArgs {
+            explicit: self.server.clone(),
             filter: self.filter(),
             protocol: self.protocol.clone(),
             exclude: self.exclude.clone(),
@@ -380,7 +385,10 @@ mod tests {
             server: vec!["JP-FREE#5".into()],
             ..Default::default()
         };
-        assert_eq!(f.filter().as_deref(), Some("japan,JP,SG,tokyo,JP-FREE#5"));
+        // -s is an answer, not a search term: it must NOT become a filter,
+        // or naming a server would trigger a scan to rank a list of one.
+        assert_eq!(f.filter().as_deref(), Some("japan,JP,SG,tokyo"));
+        assert_eq!(f.into_args(false).explicit, vec!["JP-FREE#5".to_string()]);
     }
 
     #[test]

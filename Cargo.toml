@@ -42,6 +42,10 @@ tokio = { version = "1", features = [
     "signal",
 ] }
 native-tls = "0.2"
+# In-process D-Bus. Replaces both the `nmcli` spawns and the `gdbus
+# monitor` subprocess: a property read goes from ~40ms of fork+exec to
+# about a millisecond, and signals arrive without a child process at all.
+zbus = { version = "5", features = ["blocking"] }
 regex = "1"
 
 [profile.release]
