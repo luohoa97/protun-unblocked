@@ -100,6 +100,7 @@ struct Daemon {
     backoff: Duration,
     last_attempt: Option<Instant>,
     reconnects: u64,
+    vpn: nm::VpnCache,
 }
 
 impl Daemon {
@@ -116,6 +117,7 @@ impl Daemon {
             backoff: Duration::from_secs(0),
             last_attempt: None,
             reconnects: 0,
+            vpn: nm::VpnCache::default(),
         }
     }
 
@@ -132,7 +134,7 @@ impl Daemon {
             }
 
             let want = intent::read();
-            let connected = nm::vpn_connection().is_some();
+            let connected = self.vpn.get().is_some();
 
             if want != Intent::Up {
                 self.strikes = 0;
@@ -226,6 +228,10 @@ impl Daemon {
             // alone and the health loop handles it with strikes and backoff.
             nm::Ev::Failed => tracing::warn!("NetworkManager reports the tunnel failed"),
         }
+        // A signal means the tunnel moved, so the cached name may now
+        // describe something that no longer exists. Force the next read to
+        // go to NetworkManager.
+        self.vpn.invalidate();
     }
 
     fn try_reconnect(&mut self) {
@@ -238,6 +244,7 @@ impl Daemon {
         }
         self.last_attempt = Some(Instant::now());
         self.reconnects += 1;
+        self.vpn.invalidate();
         self.dog.status("reconnecting");
 
         match reconnect(Duration::from_secs(self.cfg.reconnect_timeout)) {

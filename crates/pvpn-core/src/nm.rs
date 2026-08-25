@@ -452,3 +452,107 @@ mod tests {
         assert_eq!(first_quoted("no quotes here"), None);
     }
 }
+
+/// Interfaces NetworkManager's Proton plugins create.
+///
+/// `proton0` is the tunnel; the other two are Proton's leak-protection and
+/// kill-switch devices, which exist while a connect is in flight.
+const PROTON_IFACES: &[&str] = &["proton0", "ipv6leakintrf0", "pvpnksintrf0"];
+
+/// Is a Proton interface present? One `stat()` per name, no process spawn.
+///
+/// This is a HINT, not an answer. It cannot name the connection, and it
+/// deliberately does not try to recognise tunnels in general - `tailscale0`
+/// is also a tun device, and treating any tun as the VPN would report a
+/// tunnel that is not ours.
+pub fn proton_iface_present() -> bool {
+    PROTON_IFACES
+        .iter()
+        .any(|n| std::path::Path::new("/sys/class/net").join(n).exists())
+}
+
+/// `vpn_connection()`, without paying for `nmcli` on every single tick.
+///
+/// WHY THIS EXISTS
+///
+/// One `nmcli` call costs ~40ms of CPU. At one per 20s tick that is 172
+/// seconds of CPU per day on its own, which blew the daemon's own cost
+/// budget (docs/quality-bar.md, criterion 4) — and a daemon you can feel
+/// has to justify itself all over again.
+///
+/// So a free sysfs check gates the expensive one. nmcli remains the
+/// authority: it is called whenever presence CHANGES, and whenever we do
+/// not already have a name. The cache is only ever trusted while the
+/// world looks identical to when it was filled.
+#[derive(Debug, Default)]
+pub struct VpnCache {
+    present: Option<bool>,
+    name: Option<String>,
+}
+
+impl VpnCache {
+    pub fn get(&mut self) -> Option<String> {
+        let present = proton_iface_present();
+
+        // Unchanged since last time, and we already know the answer.
+        if self.present == Some(present) {
+            return if present { self.name.clone() } else { None };
+        }
+
+        // Something moved, or this is the first call. Ask properly.
+        let name = vpn_connection();
+        self.present = Some(present);
+        self.name = name.clone();
+        name
+    }
+
+    /// Force the next `get()` to consult nmcli.
+    ///
+    /// Called after anything that could have changed the tunnel behind our
+    /// back, so a stale name cannot outlive the connection it describes.
+    pub fn invalidate(&mut self) {
+        self.present = None;
+        self.name = None;
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    /// tailscale0 is a tun device too. Treating any tun as the VPN would
+    /// report a tunnel that is not ours, on a machine where one is simply
+    /// always present.
+    #[test]
+    fn the_hint_names_proton_interfaces_only() {
+        assert!(PROTON_IFACES.contains(&"proton0"));
+        assert!(!PROTON_IFACES.contains(&"tailscale0"));
+        assert!(!PROTON_IFACES.iter().any(|n| n.starts_with("tun")));
+    }
+
+    /// invalidate() must actually force a re-read, or a stale name outlives
+    /// the connection it describes.
+    #[test]
+    fn invalidate_clears_both_halves() {
+        let mut c = VpnCache {
+            present: Some(true),
+            name: Some("ProtonVPN X".into()),
+        };
+        c.invalidate();
+        assert!(c.present.is_none());
+        assert!(c.name.is_none());
+    }
+
+    /// A cached "absent" must report None rather than a remembered name.
+    #[test]
+    fn absent_reports_nothing_even_with_a_remembered_name() {
+        let mut c = VpnCache {
+            present: Some(false),
+            name: Some("stale".into()),
+        };
+        // present=false and the hint agrees -> None, not "stale".
+        if !proton_iface_present() {
+            assert_eq!(c.get(), None);
+        }
+    }
+}

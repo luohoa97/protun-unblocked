@@ -79,9 +79,23 @@ Proton's Python client every 20 seconds.
 **Measure:** `systemctl --user show pvpnd -p CPUUsageNSec` over 24h of real
 use.
 
-**Target:** under 2 minutes of CPU per 24h. **Now:** 51s per 10h and the
-remaining cost is one `nmcli` call per tick. **Theirs:** zero, by not
-existing — a real advantage we must keep paying down, not dismiss.
+**Target:** under 2 minutes of CPU per 24h.
+
+**Now: 29s per 24h**, measured over a 150s window in steady state (0.033%
+of a core). This criterion was *failing* when first measured — 280s/24h —
+and the cause was one `nmcli` call per 20s tick at ~40ms of CPU each, which
+is 172s/day for a question that almost never changes its answer.
+
+A free `stat()` on `/sys/class/net/proton0` now gates the expensive call.
+nmcli remains the authority and is consulted whenever presence changes or
+the name is unknown; the cache is only trusted while the world looks
+identical to when it was filled, and any NM signal invalidates it. The hint
+deliberately recognises Proton's interfaces by name rather than "any tun
+device", because `tailscale0` is also a tun and would report a tunnel that
+is not ours.
+
+**Theirs:** zero, by not existing — a real advantage we must keep paying
+down, not dismiss.
 
 ### 5. Honest status
 
