@@ -358,14 +358,26 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
                 // this project exists to catch. The ranking was being
                 // taught by the thing it is supposed to detect.
                 let verified = if args.verify {
-                    print!("  confirming traffic...");
+                    print!("  waiting for traffic...");
                     let _ = std::io::Write::flush(&mut std::io::stdout());
-                    let ok = timing.mark("verify", || {
-                        settled(cfg, Duration::from_secs(cfg.verify_secs))
+                    let when = timing.mark("verify", || {
+                        settled(Duration::from_secs(cfg.verify_secs))
                     });
-                    println!("{}", if ok { " flowing." } else { " nothing yet." });
-                    Some(ok)
+                    match when {
+                        Some(d) => println!(" flowing after {:.1}s.", d.as_secs_f64()),
+                        None => println!(" nothing yet."),
+                    }
+                    Some(when.is_some())
                 } else {
+                    // Even waiving verification, one short probe is nearly
+                    // free and stops us claiming "Connected" for a tunnel
+                    // that is demonstrably carrying nothing yet.
+                    let flowing = timing.mark("quick-probe", || {
+                        probe::traffic_flows(SETTLE_PROBE).alive
+                    });
+                    if !flowing {
+                        eprintln!("  (tunnel is up; traffic not flowing yet - not verified)");
+                    }
                     None
                 };
 
@@ -581,17 +593,52 @@ fn first_useful_line(text: &str) -> Option<String> {
 
 /// Wait up to `settle_secs` for traffic, without ever tearing the tunnel
 /// down when it runs out.
-fn settled(cfg: &Config, window: Duration) -> bool {
-    let deadline = Instant::now() + window;
-    while Instant::now() < deadline {
-        if probe::traffic_flows(Duration::from_secs(cfg.probe_timeout)).alive {
-            return true;
+/// How long a single probe may take while we are waiting for a tunnel to
+/// come alive.
+///
+/// Deliberately NOT `probe_timeout` (5s). Those are different questions.
+/// `probe_timeout` governs "is this established tunnel dead", where being
+/// patient avoids tearing down a working connection over one slow packet.
+/// Here we are asking "has it started yet", over and over, and a working
+/// tunnel answers in ~250ms. Waiting five seconds for each NO just blinds
+/// us between attempts.
+const SETTLE_PROBE: Duration = Duration::from_millis(900);
+
+/// How often to ask.
+const SETTLE_POLL: Duration = Duration::from_millis(150);
+
+/// Wait for the tunnel to actually carry traffic, and return the moment it
+/// does.
+///
+/// WHY THIS MATTERS MORE THAN IT LOOKS
+///
+/// NetworkManager reports ACTIVATED when the tunnel OBJECT exists. That is
+/// not the same as usable: protun's inner WireGuard handshake can still be
+/// pending, and until it completes every packet is dropped while the route
+/// already points into the tunnel. So `up` returning on ACTIVATED reports
+/// "Connected" for a tunnel that carries nothing for another ten seconds -
+/// which is exactly what it felt like from the outside.
+///
+/// The old loop made that worse rather than better. Each attempt used the
+/// full 5s probe_timeout, so a failed check cost ~6.5s including the sleep,
+/// and in a 20-second window there was time for THREE looks. Traffic that
+/// started flowing at t=2s went unnoticed until t=6.5s. Most of the wait
+/// was polling resolution, not the tunnel.
+///
+/// Short probes, polled tightly: now it notices within ~150ms of the first
+/// packet getting through.
+fn settled(window: Duration) -> Option<Duration> {
+    let started = Instant::now();
+    let deadline = started + window;
+    loop {
+        if probe::traffic_flows(SETTLE_PROBE).alive {
+            return Some(started.elapsed());
         }
-        // Poll briskly: this is the user waiting, and the probe itself
-        // already costs a round trip.
-        std::thread::sleep(Duration::from_millis(500));
+        if Instant::now() + SETTLE_POLL >= deadline {
+            return None;
+        }
+        std::thread::sleep(SETTLE_POLL);
     }
-    false
 }
 
 /// Candidate servers, from the scanner, cached per network.

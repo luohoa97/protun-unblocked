@@ -77,10 +77,18 @@ pub struct Config {
     /// Seconds to wait for first traffic before calling a connect
     /// unproven.
     ///
-    /// NOT settle_secs. That is 90 and governs when to give up on a tunnel
-    /// entirely; running out of it never tears one down. This is the much
-    /// shorter window for deciding whether to CREDIT the server, so a
-    /// connect does not sit for a minute and a half before returning.
+    /// A CEILING, not a delay. Verification returns the instant traffic
+    /// flows - typically within 150ms of the first packet getting through -
+    /// so raising this costs nothing when the tunnel works. It is only paid
+    /// when the tunnel really is dead.
+    ///
+    /// 30s because time to first packet has been measured on these networks
+    /// at 12s, >20s and >45s. At 20 a slow-but-fine server was being marked
+    /// unproven, which taught the ranking to avoid servers that work.
+    ///
+    /// Still NOT settle_secs (90): that governs when to give up on a tunnel
+    /// entirely and never tears one down, while this only decides whether
+    /// to CREDIT the server.
     pub verify_secs: u64,
 
     /// How many proven servers this network needs before `pvpn up` stops
@@ -113,7 +121,7 @@ impl Default for Config {
             reconnect_timeout: 120,
             trust_after_servers: 3,
             verify: true,
-            verify_secs: 20,
+            verify_secs: 30,
         }
     }
 }
