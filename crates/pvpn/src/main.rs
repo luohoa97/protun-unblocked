@@ -116,6 +116,14 @@ struct UpFlags {
     #[arg(short = 's', long = "server")]
     server: Vec<String>,
 
+    /// Try this server first, then fall back to the ranking.
+    ///
+    /// Unlike --server, this is a preference with a safety net. pvpnd uses
+    /// it to reconnect to whatever was working before a drop rather than
+    /// re-ranking from scratch and landing somewhere new.
+    #[arg(long, value_name = "SERVER")]
+    prefer: Option<String>,
+
     /// Pin a protocol instead of letting the network decide.
     #[arg(short, long)]
     protocol: Option<String>,
@@ -159,6 +167,7 @@ impl UpFlags {
     fn into_args(self, hop: bool) -> connect::UpArgs {
         connect::UpArgs {
             explicit: self.server.clone(),
+            prefer: self.prefer.clone(),
             filter: self.filter(),
             protocol: self.protocol.clone(),
             exclude: self.exclude.clone(),
@@ -464,6 +473,7 @@ mod tests {
             &["pvpn", "up", "--verify"],
             &["pvpn", "up", "--not", "SG-FREE#12"],
             &["pvpn", "up", "--attempts", "5"],
+            &["pvpn", "up", "--prefer", "SG-FREE#20"],
             &["pvpn", "down"],
             &["pvpn", "disconnect"],
             &["pvpn", "hop"],

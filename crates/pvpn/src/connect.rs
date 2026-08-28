@@ -43,6 +43,14 @@ pub struct UpArgs {
     /// "probing 1 servers, 2 samples each" before connecting to the only
     /// candidate it had.
     pub explicit: Vec<String>,
+    /// Try this server FIRST, then fall back to the ranking.
+    ///
+    /// Different from `explicit`, which means "this one and nothing else".
+    /// This is a preference with a safety net, and it exists for the
+    /// daemon: after a drop, the server that was working thirty seconds ago
+    /// is the strongest evidence available. Reconnecting by re-ranking from
+    /// scratch throws that away and can land on one the filter kills.
+    pub prefer: Option<String>,
     pub filter: Option<String>,
     pub protocol: Option<String>,
     pub exclude: Vec<String>,
@@ -64,6 +72,7 @@ impl Default for UpArgs {
     fn default() -> Self {
         Self {
             explicit: Vec::new(),
+            prefer: None,
             filter: None,
             protocol: None,
             exclude: Vec::new(),
@@ -234,7 +243,7 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
     let mut memory = NetworkMemory::load(&network);
 
     let mut confident: Vec<String> = Vec::new();
-    let targets = if !args.explicit.is_empty() {
+    let mut targets = if !args.explicit.is_empty() {
         // Named outright: nothing to measure, nothing to choose.
         args.explicit.clone()
     } else if args.no_scan {
@@ -285,6 +294,8 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
             .filter(|t| !args.exclude.iter().any(|x| x == t))
             .collect()
     };
+
+    targets = with_preferred(targets, args.prefer.as_deref(), &args.exclude);
 
     if targets.is_empty() && !args.no_scan {
         if args.filter.is_some() {
@@ -513,6 +524,29 @@ fn fast_activate(cfg: &Config, server: &str) -> Option<ConnectResult> {
             None
         }
     }
+}
+
+/// Put the preferred server at the head of the list, keeping the ranking
+/// behind it as the fallback.
+///
+/// One invocation, two tiers: try what was working, then try what is best.
+/// A preference that is excluded (`--not`, or a hop moving away from it) is
+/// ignored rather than honoured - otherwise `pvpn hop` would keep choosing
+/// the server it was asked to leave.
+fn with_preferred(
+    mut targets: Vec<String>,
+    prefer: Option<&str>,
+    exclude: &[String],
+) -> Vec<String> {
+    let Some(pref) = prefer else {
+        return targets;
+    };
+    if exclude.iter().any(|x| x == pref) {
+        return targets;
+    }
+    targets.retain(|t| t != pref);
+    targets.insert(0, pref.to_string());
+    targets
 }
 
 enum ConnectResult {
@@ -767,6 +801,38 @@ pub fn parse_scan_full(text: &str) -> Vec<(String, u64, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// After a drop, the server that was working is the strongest evidence
+    /// there is - but it must not become the ONLY option, or a server that
+    /// died for good would strand the reconnect.
+    #[test]
+    fn preferred_goes_first_and_the_ranking_survives_as_fallback() {
+        let ranked = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let out = with_preferred(ranked.clone(), Some("B"), &[]);
+        assert_eq!(out, vec!["B", "A", "C"], "preferred first, no duplicate");
+        assert_eq!(out.len(), 3, "the fallbacks are still there");
+
+        // A server not in the ranking is still tried first.
+        let out = with_preferred(ranked.clone(), Some("Z"), &[]);
+        assert_eq!(out[0], "Z");
+        assert_eq!(out.len(), 4);
+    }
+
+    /// `pvpn hop` excludes the server it is leaving. Honouring a preference
+    /// for it anyway would make hop reconnect to exactly what it was told
+    /// to move away from.
+    #[test]
+    fn an_excluded_server_is_never_preferred() {
+        let ranked = vec!["A".to_string(), "B".to_string()];
+        let out = with_preferred(ranked.clone(), Some("A"), &["A".to_string()]);
+        assert_eq!(out, ranked, "exclusion wins over preference");
+    }
+
+    #[test]
+    fn no_preference_leaves_the_ranking_alone() {
+        let ranked = vec!["A".to_string(), "B".to_string()];
+        assert_eq!(with_preferred(ranked.clone(), None, &[]), ranked);
+    }
 
     #[test]
     fn scan_json_parses_names_in_order() {

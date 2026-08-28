@@ -156,6 +156,14 @@ pub struct NetworkMemory {
     /// Server name -> what we know. BTreeMap so the file is stable on disk
     /// and diffs are readable.
     pub servers: BTreeMap<String, ServerRecord>,
+    /// The last server that verifiably carried traffic here.
+    ///
+    /// Kept separately from the ranking because it answers a different
+    /// question. Ranking asks "which server is best in general on this
+    /// network". After a drop the better question is "which one was working
+    /// thirty seconds ago" - that is the strongest evidence available, and
+    /// it is about to be thrown away by a fresh ranking pass.
+    pub last_good: Option<String>,
     pub updated: u64,
 }
 
@@ -306,6 +314,7 @@ impl NetworkMemory {
         rec.last_error = None;
         // A proven connect clears the doubt too, not just the block.
         rec.unverified = 0;
+        self.last_good = Some(server.to_string());
     }
 
     /// Record that connecting failed, and why.
@@ -753,6 +762,22 @@ mod tests {
         m.record_success("A");
         assert_eq!(m.servers["A"].unverified, 0);
         assert!(!m.servers["A"].is_blocked(24, now_secs()));
+    }
+
+    /// After a drop, the server that was working is the strongest evidence
+    /// there is. Losing it means a reconnect re-ranks from scratch and can
+    /// land somewhere the filter kills.
+    #[test]
+    fn a_verified_connect_is_remembered_as_last_good() {
+        let mut m = NetworkMemory::default();
+        assert_eq!(m.last_good, None);
+        m.record_success("SG-FREE#20");
+        assert_eq!(m.last_good.as_deref(), Some("SG-FREE#20"));
+
+        // An unverified connect must NOT overwrite it - that is the whole
+        // point of verifying.
+        m.record_unverified("JP-FREE#3");
+        assert_eq!(m.last_good.as_deref(), Some("SG-FREE#20"));
     }
 
     #[test]

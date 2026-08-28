@@ -359,21 +359,48 @@ enum Reconnect {
 /// SIGTERM is ignored.
 fn reconnect(limit: Duration) -> Reconnect {
     let pvpn = paths::pvpn_bin();
-    tracing::info!(timeout_secs = limit.as_secs(), "reconnecting: pvpn up");
+
+    // Reconnect to WHAT WAS WORKING, not to whatever ranks best now.
+    //
+    // This was the bug behind "when it reconnects it goes to a completely
+    // different server and doesn't work". `pvpn up` with no arguments
+    // re-ranks from scratch, which throws away the single strongest piece
+    // of evidence available: the server that was carrying traffic thirty
+    // seconds ago. On a filtered network a fresh pick can easily land on
+    // one the filter kills, and that costs five protun retries and ~22
+    // seconds before it even fails.
+    //
+    // --prefer, not --server: it goes to the front of the list and the
+    // ranking stays behind it. If the old server really is the reason the
+    // tunnel dropped, the fallback is automatic and in the same invocation.
+    let preferred = pvpn_core::learn::NetworkMemory::load_current().last_good;
+
+    match &preferred {
+        Some(s) => tracing::info!(server = %s, timeout_secs = limit.as_secs(),
+            "reconnecting, preferring the server that was working"),
+        None => tracing::info!(timeout_secs = limit.as_secs(),
+            "reconnecting: nothing proven on this network yet, ranking will choose"),
+    }
+
+    let mut args: Vec<String> = vec!["up".into()];
+    if let Some(s) = preferred {
+        args.push("--prefer".into());
+        args.push(s);
+    }
 
     let mut cmd = if which("timeout").is_some() {
         let mut c = std::process::Command::new("timeout");
         c.arg("--kill-after=10")
             .arg(format!("{}", limit.as_secs()))
             .arg(&pvpn)
-            .arg("up");
+            .args(&args);
         c
     } else {
         // Without coreutils there is no bound. Say so loudly - this is the
         // configuration in which the daemon can still wedge.
         tracing::warn!("coreutils `timeout` not found; reconnect is UNBOUNDED");
         let mut c = std::process::Command::new(&pvpn);
-        c.arg("up");
+        c.args(&args);
         c
     };
 
