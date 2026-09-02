@@ -606,6 +606,51 @@ fn fast_activate(cfg: &Config, server: &str) -> Option<ConnectResult> {
     }
 }
 
+/// `pvpn scan` - measure this network without connecting.
+///
+/// REFUSES while a tunnel is up, rather than warning and doing it anyway.
+///
+/// A scan measures TLS handshakes to Proton's servers. With a tunnel up
+/// those handshakes travel through it, so every number describes the path
+/// from your exit node - not from this network. The old behaviour printed
+/// a warning and then produced a full, confident, meaningless table, which
+/// is worse than refusing: the numbers look exactly like real ones and
+/// they get believed.
+pub fn cmd_scan(cfg: &Config, filter: Option<&str>, force: bool) -> Result<u8> {
+    let scanner = proton::shim_dir().join("pvpn-scan.py");
+    if !scanner.is_file() {
+        anyhow::bail!("scanner missing at {} - re-run setup.sh", scanner.display());
+    }
+
+    if !force {
+        if let Some(tunnel) = proton::current_server() {
+            eprintln!("Refusing to scan: you are connected to {tunnel}.");
+            eprintln!();
+            eprintln!("Handshakes would travel through the tunnel, so the numbers would");
+            eprintln!("describe your exit node's network rather than this one - and they");
+            eprintln!("would look exactly like real measurements.");
+            eprintln!();
+            eprintln!("  pvpn down && pvpn scan     measure this network");
+            eprintln!("  pvpn scan --force          measure from inside the tunnel anyway");
+            return Ok(1);
+        }
+    }
+
+    let mut cmd = Command::new("/usr/bin/python3");
+    cmd.arg(&scanner);
+    if let Some(f) = filter {
+        cmd.arg(f);
+    }
+    let status = cmd
+        .arg("--workers")
+        .arg("12")
+        .env("PYTHONPATH", proton::shim_dir())
+        .status()
+        .context("running the scanner")?;
+    let _ = cfg;
+    Ok(status.code().unwrap_or(1) as u8)
+}
+
 /// Put the preferred server at the head of the list, keeping the ranking
 /// behind it as the fallback.
 ///

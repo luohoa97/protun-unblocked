@@ -86,7 +86,14 @@ enum Cmd {
     /// Sign in.
     Login { args: Vec<String> },
     /// Measure this network without connecting.
-    Scan { args: Vec<String> },
+    Scan {
+        /// Country, city or server name to narrow the measurement.
+        filter: Option<String>,
+        /// Measure even while connected, knowing the numbers describe your
+        /// exit node rather than this network.
+        #[arg(long)]
+        force: bool,
+    },
     /// Which protocol backends are actually installed.
     Protocols,
     /// Privileged cleanup (needs sudo).
@@ -259,7 +266,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Apps { fix } => apps::cmd_apps(fix, cli.json).map(ExitCode::from),
         Cmd::Try => delegate("try", &[]),
         Cmd::Login { args } => delegate("login", &args),
-        Cmd::Scan { args } => delegate("scan", &args),
+        Cmd::Scan { filter, force } => {
+            connect::cmd_scan(&cfg, filter.as_deref(), force).map(ExitCode::from)
+        }
         Cmd::Protocols => delegate("protocols", &[]),
         Cmd::Fix { args } => delegate("fix", &args),
     }
@@ -522,6 +531,9 @@ mod tests {
             &["pvpn", "apps"],
             &["pvpn", "apps", "--fix"],
             &["pvpn", "state"],
+            &["pvpn", "scan"],
+            &["pvpn", "scan", "japan"],
+            &["pvpn", "scan", "--force"],
             &["pvpn", "protocols"],
             &["pvpn", "-v", "status"],
         ];

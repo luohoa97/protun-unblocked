@@ -24,6 +24,38 @@ use serde::{Deserialize, Serialize};
 
 use crate::{intent::now_secs, net, paths};
 
+/// The shortest time a real connect can take, in ms.
+///
+/// Nothing gets recorded below this. A record of `connect_ms: 228` existed
+/// in the wild - impossible, since a connect includes protun's handshake
+/// and its retry loop - and it came from timing "NetworkManager accepted
+/// the activation" rather than "traffic flowed". It then outranked a
+/// genuine 11.6s record by fifty times and won every selection.
+const MIN_PLAUSIBLE_CONNECT_MS: u64 = 800;
+
+/// Does this look like a server we could actually connect to?
+///
+/// Proton names free servers `XX-FREE#N`; hopping also leaves profiles
+/// named after bare entry IPs. Anything else is not a server, and the only
+/// way one ever got in was a bug - `pvpn up --prefer latency` recorded a
+/// "server" called `latency`, complete with connect times and a block,
+/// and set it as the network's last known good.
+///
+/// Validated on the way IN and on the way OUT, because the bad data is
+/// already on disk in the field.
+pub fn is_plausible_server(name: &str) -> bool {
+    let n = name.trim();
+    if n.is_empty() || n.len() > 64 {
+        return false;
+    }
+    // XX-FREE#12, CH-TOR#3, US-NY#8 ...
+    if n.contains('#') && n.contains('-') {
+        return true;
+    }
+    // A bare IPv4 entry address left behind by a hop.
+    n.parse::<std::net::IpAddr>().is_ok()
+}
+
 /// Estimated cost of a connect to a server we have measured but never
 /// actually connected to, in milliseconds.
 ///
@@ -257,7 +289,13 @@ impl NetworkMemory {
         let path = Self::path_for(network);
         match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Self>(&text) {
-                Ok(m) => m,
+                Ok(mut m) => {
+                    let dropped = m.sanitise();
+                    if dropped > 0 {
+                        tracing::warn!(dropped, "dropped entries that are not servers");
+                    }
+                    m
+                }
                 Err(e) => {
                     // A corrupt memory file must not stop you connecting.
                     // Starting over costs one slow connect; refusing to run
@@ -284,22 +322,63 @@ impl NetworkMemory {
         paths::write_atomic(&Self::path_for(&self.network), &format!("{json}\n"))
     }
 
-    fn entry(&mut self, server: &str) -> &mut ServerRecord {
+    /// Get or create a record, or `None` if the name is not a server.
+    ///
+    /// Refusing here is what stops a flag-parsing bug from inventing a
+    /// server and then ranking it first.
+    fn entry(&mut self, server: &str) -> Option<&mut ServerRecord> {
+        if !is_plausible_server(server) {
+            tracing::warn!(server, "refusing to record a non-server name");
+            return None;
+        }
         let rec = self.servers.entry(server.to_string()).or_default();
         rec.last_seen = now_secs();
-        rec
+        Some(rec)
+    }
+
+    /// Drop anything that could not have come from a real connect.
+    ///
+    /// Runs on every load, so memory already poisoned in the field heals
+    /// itself rather than needing the user to delete a file they do not
+    /// know exists.
+    fn sanitise(&mut self) -> usize {
+        let before = self.servers.len();
+        self.servers.retain(|name, _| is_plausible_server(name));
+
+        for rec in self.servers.values_mut() {
+            if let Some(ms) = rec.connect_ms {
+                if ms < MIN_PLAUSIBLE_CONNECT_MS {
+                    // Not a connect time. Drop the number, keep the
+                    // outcome history - the successes were real even
+                    // though the timing was not.
+                    rec.connect_ms = None;
+                }
+            }
+        }
+
+        if let Some(lg) = &self.last_good {
+            if !is_plausible_server(lg) || !self.servers.contains_key(lg) {
+                tracing::warn!(server = %lg, "clearing a last_good that is not a real server");
+                self.last_good = None;
+            }
+        }
+        before - self.servers.len()
     }
 
     /// Record a latency measurement.
     pub fn record_latency(&mut self, server: &str, ms: u64, intercepted: bool) {
-        let rec = self.entry(server);
+        let Some(rec) = self.entry(server) else { return };
         rec.latency_ms = Some(ms);
         rec.intercepted = intercepted;
     }
 
     /// Record how long a successful connect actually took.
     pub fn record_connect_time(&mut self, server: &str, ms: u64) {
-        let rec = self.entry(server);
+        if ms < MIN_PLAUSIBLE_CONNECT_MS {
+            tracing::warn!(server, ms, "ignoring an implausibly fast connect time");
+            return;
+        }
+        let Some(rec) = self.entry(server) else { return };
         rec.connect_ms = Some(match rec.connect_ms {
             Some(best) => best.min(ms),
             None => ms,
@@ -311,7 +390,7 @@ impl NetworkMemory {
     /// Blocks only on the second occurrence, for the reason on `unverified`:
     /// one slow settle is normal here, two is a pattern.
     pub fn record_unverified(&mut self, server: &str) -> bool {
-        let rec = self.entry(server);
+        let Some(rec) = self.entry(server) else { return false };
         rec.unverified = rec.unverified.saturating_add(1);
         if rec.unverified >= 2 {
             rec.failed += 1;
@@ -331,7 +410,7 @@ impl NetworkMemory {
     /// keeping strikes would mean one good connect still left it one
     /// failure away from a 4x block.
     pub fn record_success(&mut self, server: &str) {
-        let rec = self.entry(server);
+        let Some(rec) = self.entry(server) else { return };
         rec.ok += 1;
         rec.blocked_at = None;
         rec.block_strikes = 0;
@@ -341,9 +420,10 @@ impl NetworkMemory {
         self.last_good = Some(server.to_string());
     }
 
+
     /// Record that connecting failed, and why.
     pub fn record_failure(&mut self, server: &str, why: impl Into<String>) {
-        let rec = self.entry(server);
+        let Some(rec) = self.entry(server) else { return };
         rec.failed += 1;
         rec.blocked_at = Some(now_secs());
         rec.block_strikes = rec.block_strikes.saturating_add(1);
@@ -586,10 +666,10 @@ mod tests {
     #[test]
     fn connect_time_keeps_the_best_observation() {
         let mut m = NetworkMemory::default();
-        m.record_connect_time("A", 12_000);
-        m.record_connect_time("A", 2_500);
-        m.record_connect_time("A", 9_000);
-        assert_eq!(m.servers["A"].connect_ms, Some(2_500));
+        m.record_connect_time("JP-FREE#1", 12_000);
+        m.record_connect_time("JP-FREE#1", 2_500);
+        m.record_connect_time("JP-FREE#1", 9_000);
+        assert_eq!(m.servers["JP-FREE#1"].connect_ms, Some(2_500));
     }
 
     /// Expected time to a *working tunnel* is the thing being ordered, not
@@ -638,13 +718,13 @@ mod tests {
     #[test]
     fn success_clears_the_block_and_the_strikes() {
         let mut m = NetworkMemory::default();
-        m.record_failure("SG#1", "timeout");
-        m.record_failure("SG#1", "timeout");
-        assert!(m.servers["SG#1"].is_blocked(24, now_secs()));
-        assert_eq!(m.servers["SG#1"].block_strikes, 2);
+        m.record_failure("SG-FREE#1", "timeout");
+        m.record_failure("SG-FREE#1", "timeout");
+        assert!(m.servers["SG-FREE#1"].is_blocked(24, now_secs()));
+        assert_eq!(m.servers["SG-FREE#1"].block_strikes, 2);
 
-        m.record_success("SG#1");
-        let r = &m.servers["SG#1"];
+        m.record_success("SG-FREE#1");
+        let r = &m.servers["SG-FREE#1"];
         assert!(!r.is_blocked(24, now_secs()));
         assert_eq!(r.block_strikes, 0, "a working server is not on probation");
         assert!(r.last_error.is_none());
@@ -653,21 +733,21 @@ mod tests {
     #[test]
     fn ranking_excludes_blocked_servers() {
         let mut m = NetworkMemory::default();
-        m.record_latency("A", 10, false);
-        m.record_latency("B", 50, false);
-        m.record_failure("A", "refused");
+        m.record_latency("JP-FREE#1", 10, false);
+        m.record_latency("JP-FREE#2", 50, false);
+        m.record_failure("JP-FREE#1", "refused");
 
-        let order = m.rank(&["A".into(), "B".into()], 24);
-        assert_eq!(order, vec!["B".to_string()], "A is blocked");
+        let order = m.rank(&["JP-FREE#1".into(), "JP-FREE#2".into()], 24);
+        assert_eq!(order, vec!["JP-FREE#2".to_string()], "A is blocked");
     }
 
     /// Being offline is worse than trying something that failed yesterday.
     #[test]
     fn ranking_never_returns_nothing() {
         let mut m = NetworkMemory::default();
-        m.record_failure("A", "x");
-        m.record_failure("B", "x");
-        let order = m.rank(&["A".into(), "B".into()], 24);
+        m.record_failure("JP-FREE#1", "x");
+        m.record_failure("JP-FREE#2", "x");
+        let order = m.rank(&["JP-FREE#1".into(), "JP-FREE#2".into()], 24);
         assert_eq!(order.len(), 2, "must fall back rather than strand the user");
     }
 
@@ -695,15 +775,15 @@ mod tests {
     #[test]
     fn evidence_beats_scanner_order() {
         let mut m = NetworkMemory::default();
-        let scanner_order: Vec<String> = vec!["untried-quick".into(), "proven".into()];
-        m.record_latency("untried-quick", 10, false);
-        m.record_latency("proven", 400, false);
-        m.record_success("proven");
-        m.record_connect_time("proven", 2_000);
+        let scanner_order: Vec<String> = vec!["CA-FREE#1".into(), "SG-FREE#12".into()];
+        m.record_latency("CA-FREE#1", 10, false);
+        m.record_latency("SG-FREE#12", 400, false);
+        m.record_success("SG-FREE#12");
+        m.record_connect_time("SG-FREE#12", 2_000);
 
         assert_eq!(
             m.rank(&scanner_order, 24)[0],
-            "proven",
+            "SG-FREE#12",
             "a server proven to connect in 2s must beat an untried one"
         );
     }
@@ -745,27 +825,27 @@ mod tests {
         let mut m = NetworkMemory::default();
 
         // Measured, never connected: not evidence.
-        m.record_latency("measured-only", 50, false);
+        m.record_latency("NL-FREE#1", 50, false);
 
         // Connected, but we did not time it: not evidence either.
-        m.record_success("no-timing");
+        m.record_success("NL-FREE#2");
 
         // The real thing.
-        m.record_latency("proven", 300, false);
-        m.record_success("proven");
-        m.record_connect_time("proven", 3_000);
+        m.record_latency("SG-FREE#12", 300, false);
+        m.record_success("SG-FREE#12");
+        m.record_connect_time("SG-FREE#12", 3_000);
 
-        assert_eq!(m.confident_choices(24), vec!["proven".to_string()]);
+        assert_eq!(m.confident_choices(24), vec!["SG-FREE#12".to_string()]);
     }
 
     /// A blocked server is not a choice, however good its history.
     #[test]
     fn confidence_excludes_blocked_servers() {
         let mut m = NetworkMemory::default();
-        m.record_success("A");
-        m.record_connect_time("A", 2_000);
+        m.record_success("JP-FREE#1");
+        m.record_connect_time("JP-FREE#1", 2_000);
         assert_eq!(m.confident_choices(24).len(), 1);
-        m.record_failure("A", "refused");
+        m.record_failure("JP-FREE#1", "refused");
         assert!(m.confident_choices(24).is_empty());
     }
 
@@ -776,27 +856,27 @@ mod tests {
     #[test]
     fn sibling_evidence_reorders_but_does_not_exclude() {
         let mut m = NetworkMemory::default();
-        m.record_latency("A", 100, false);
-        m.record_latency("B", 100, false);
+        m.record_latency("JP-FREE#1", 100, false);
+        m.record_latency("JP-FREE#2", 100, false);
 
         let mut priors = BTreeMap::new();
         priors.insert(
-            "A".to_string(),
+            "JP-FREE#1".to_string(),
             RealmPrior {
                 refused_at: 3,
                 worked_at: 0,
             },
         );
         priors.insert(
-            "B".to_string(),
+            "JP-FREE#2".to_string(),
             RealmPrior {
                 refused_at: 0,
                 worked_at: 3,
             },
         );
 
-        let order = m.rank_with(&["A".into(), "B".into()], 24, &priors);
-        assert_eq!(order[0], "B", "the server siblings trust goes first");
+        let order = m.rank_with(&["JP-FREE#1".into(), "JP-FREE#2".into()], 24, &priors);
+        assert_eq!(order[0], "JP-FREE#2", "the server siblings trust goes first");
         assert_eq!(order.len(), 2, "the other one is still offered");
     }
 
@@ -829,12 +909,12 @@ mod tests {
     #[test]
     fn unverified_blocks_only_on_the_second_occurrence() {
         let mut m = NetworkMemory::default();
-        assert!(!m.record_unverified("A"), "first must not block");
-        assert!(!m.servers["A"].is_blocked(24, now_secs()));
+        assert!(!m.record_unverified("JP-FREE#1"), "first must not block");
+        assert!(!m.servers["JP-FREE#1"].is_blocked(24, now_secs()));
 
-        assert!(m.record_unverified("A"), "second must block");
-        assert!(m.servers["A"].is_blocked(24, now_secs()));
-        assert!(m.servers["A"]
+        assert!(m.record_unverified("JP-FREE#1"), "second must block");
+        assert!(m.servers["JP-FREE#1"].is_blocked(24, now_secs()));
+        assert!(m.servers["JP-FREE#1"]
             .last_error
             .as_deref()
             .unwrap()
@@ -847,12 +927,12 @@ mod tests {
     #[test]
     fn a_verified_connect_clears_previous_doubt() {
         let mut m = NetworkMemory::default();
-        m.record_unverified("A");
-        assert_eq!(m.servers["A"].unverified, 1);
+        m.record_unverified("JP-FREE#1");
+        assert_eq!(m.servers["JP-FREE#1"].unverified, 1);
 
-        m.record_success("A");
-        assert_eq!(m.servers["A"].unverified, 0);
-        assert!(!m.servers["A"].is_blocked(24, now_secs()));
+        m.record_success("JP-FREE#1");
+        assert_eq!(m.servers["JP-FREE#1"].unverified, 0);
+        assert!(!m.servers["JP-FREE#1"].is_blocked(24, now_secs()));
     }
 
     /// After a drop, the server that was working is the strongest evidence
@@ -871,16 +951,94 @@ mod tests {
         assert_eq!(m.last_good.as_deref(), Some("SG-FREE#20"));
     }
 
+    /// A flag-parsing bug invented a "server" called `latency`, gave it
+    /// connect times and a block, and made it the network's last_good - so
+    /// the daemon reconnected to a name that matches nothing and Proton
+    /// picked freely. Refuse the name and none of that is possible.
+    #[test]
+    fn non_server_names_are_refused() {
+        assert!(is_plausible_server("SG-FREE#20"));
+        assert!(is_plausible_server("CH-TOR#3"));
+        assert!(is_plausible_server("156.47.78.177"));
+
+        assert!(!is_plausible_server("latency"));
+        assert!(!is_plausible_server("load"));
+        assert!(!is_plausible_server("balanced"));
+        assert!(!is_plausible_server(""));
+        assert!(!is_plausible_server("   "));
+
+        let mut m = NetworkMemory::default();
+        m.record_latency("latency", 100, false);
+        m.record_success("latency");
+        m.record_connect_time("latency", 5_000);
+        assert!(m.servers.is_empty(), "no record may be created at all");
+        assert_eq!(m.last_good, None, "and it must never become last_good");
+    }
+
+    /// 228ms is not a connect. It is a handshake, recorded when the fast
+    /// path timed "NetworkManager accepted the activation" instead of
+    /// "traffic flowed" - and it then outranked a genuine 11.6s record by
+    /// fifty times and won every selection.
+    #[test]
+    fn implausibly_fast_connect_times_are_ignored() {
+        let mut m = NetworkMemory::default();
+        m.record_success("SG-FREE#20");
+        m.record_connect_time("SG-FREE#20", 228);
+        assert_eq!(m.servers["SG-FREE#20"].connect_ms, None);
+
+        m.record_connect_time("SG-FREE#20", 11_676);
+        assert_eq!(m.servers["SG-FREE#20"].connect_ms, Some(11_676));
+    }
+
+    /// Memory already poisoned in the field must heal on load, without the
+    /// user having to know a file exists.
+    #[test]
+    fn loading_sanitises_bad_records() {
+        let mut m = NetworkMemory {
+            network: "x".into(),
+            last_good: Some("latency".into()),
+            ..Default::default()
+        };
+        m.servers.insert("latency".into(), ServerRecord::default());
+        m.servers.insert(
+            "SG-FREE#20".into(),
+            ServerRecord {
+                connect_ms: Some(228),
+                ok: 6,
+                ..Default::default()
+            },
+        );
+
+        let dropped = m.sanitise();
+        assert_eq!(dropped, 1, "the phantom server is gone");
+        assert!(!m.servers.contains_key("latency"));
+        assert_eq!(m.last_good, None, "last_good pointed at the phantom");
+        // The bogus timing is dropped, the real outcome history is kept.
+        assert_eq!(m.servers["SG-FREE#20"].connect_ms, None);
+        assert_eq!(m.servers["SG-FREE#20"].ok, 6);
+    }
+
+    /// A last_good naming a server we have no record of is stale too.
+    #[test]
+    fn last_good_must_name_a_server_we_know() {
+        let mut m = NetworkMemory {
+            last_good: Some("JP-FREE#9".into()),
+            ..Default::default()
+        };
+        m.sanitise();
+        assert_eq!(m.last_good, None);
+    }
+
     #[test]
     fn pruning_drops_only_stale_records() {
         let mut m = NetworkMemory::default();
-        m.record_latency("old", 10, false);
-        m.record_latency("new", 10, false);
-        m.servers.get_mut("old").unwrap().last_seen = now_secs() - 400 * 86_400;
+        m.record_latency("US-FREE#1", 10, false);
+        m.record_latency("US-FREE#2", 10, false);
+        m.servers.get_mut("US-FREE#1").unwrap().last_seen = now_secs() - 400 * 86_400;
 
         assert_eq!(m.prune(90), 1);
-        assert!(m.servers.contains_key("new"));
-        assert!(!m.servers.contains_key("old"));
+        assert!(m.servers.contains_key("US-FREE#2"));
+        assert!(!m.servers.contains_key("US-FREE#1"));
     }
 
     #[test]
@@ -889,22 +1047,22 @@ mod tests {
             network: "home-abc123".into(),
             ..Default::default()
         };
-        m.record_latency("SG#1", 42, false);
-        m.record_success("SG#1");
+        m.record_latency("SG-FREE#1", 42, false);
+        m.record_success("SG-FREE#1");
         let text = serde_json::to_string(&m).unwrap();
         let back: NetworkMemory = serde_json::from_str(&text).unwrap();
         assert_eq!(back.network, "home-abc123");
-        assert_eq!(back.servers["SG#1"].latency_ms, Some(42));
-        assert_eq!(back.servers["SG#1"].ok, 1);
+        assert_eq!(back.servers["SG-FREE#1"].latency_ms, Some(42));
+        assert_eq!(back.servers["SG-FREE#1"].ok, 1);
     }
 
     /// An older file has fewer fields. It must still load, or an upgrade
     /// throws away everything the user's networks taught them.
     #[test]
     fn older_memory_files_still_load() {
-        let old = r#"{"network":"x","servers":{"A":{"latency_ms":10}},"updated":1}"#;
+        let old = r#"{"network":"x","servers":{"JP-FREE#1":{"latency_ms":10}},"updated":1}"#;
         let m: NetworkMemory = serde_json::from_str(old).unwrap();
-        assert_eq!(m.servers["A"].latency_ms, Some(10));
-        assert_eq!(m.servers["A"].ok, 0);
+        assert_eq!(m.servers["JP-FREE#1"].latency_ms, Some(10));
+        assert_eq!(m.servers["JP-FREE#1"].ok, 0);
     }
 }

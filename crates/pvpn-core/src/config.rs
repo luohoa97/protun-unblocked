@@ -82,9 +82,12 @@ pub struct Config {
     /// so raising this costs nothing when the tunnel works. It is only paid
     /// when the tunnel really is dead.
     ///
-    /// 30s because time to first packet has been measured on these networks
-    /// at 12s, >20s and >45s. At 20 a slow-but-fine server was being marked
-    /// unproven, which taught the ranking to avoid servers that work.
+    /// 45s, raised from 30 after SG-FREE#5 was measured flowing at 26.5s
+    /// once and timing out at 30s twice on the same afternoon. That is a
+    /// working server sitting right on the ceiling, and two of those three
+    /// runs recorded it as unproven - teaching the ranking to avoid a
+    /// server that works. A ceiling has to sit clear of the distribution,
+    /// not through the middle of it.
     ///
     /// Still NOT settle_secs (90): that governs when to give up on a tunnel
     /// entirely and never tears one down, while this only decides whether
@@ -131,7 +134,7 @@ impl Default for Config {
             trust_after_servers: 3,
             scan_ttl_mins: 360,
             verify: true,
-            verify_secs: 30,
+            verify_secs: 45,
         }
     }
 }
