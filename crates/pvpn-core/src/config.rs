@@ -91,6 +91,15 @@ pub struct Config {
     /// to CREDIT the server.
     pub verify_secs: u64,
 
+    /// Minutes a scan result stays usable before `pvpn up` re-measures.
+    ///
+    /// Long, because a scan is the loudest thing this tool emits and a
+    /// network rarely changes between one connect and the next. It is not
+    /// the only thing keeping scans rare - once a network has proven
+    /// servers, `up` skips measurement entirely - so this only governs the
+    /// period BEFORE anything is proven.
+    pub scan_ttl_mins: u64,
+
     /// How many proven servers this network needs before `pvpn up` stops
     /// measuring and just uses what it learned.
     ///
@@ -120,6 +129,7 @@ impl Default for Config {
             autoreconnect: true,
             reconnect_timeout: 120,
             trust_after_servers: 3,
+            scan_ttl_mins: 360,
             verify: true,
             verify_secs: 30,
         }
@@ -194,6 +204,7 @@ impl Config {
             "autoreconnect" => self.autoreconnect = truthy(value, self.autoreconnect),
             "reconnect_timeout" => num(value, &mut self.reconnect_timeout),
             "trust_after_servers" => num(value, &mut self.trust_after_servers),
+            "scan_ttl_mins" => num(value, &mut self.scan_ttl_mins),
             "verify" => self.verify = truthy(value, self.verify),
             "verify_secs" => num(value, &mut self.verify_secs),
             // Unknown keys are ignored, not rejected. Old installs carry
@@ -237,6 +248,7 @@ impl Config {
         self.strikes = self.strikes.clamp(1, 20);
         self.reconnect_timeout = self.reconnect_timeout.clamp(30, 900);
         self.trust_after_servers = self.trust_after_servers.min(20);
+        self.scan_ttl_mins = self.scan_ttl_mins.clamp(1, 10_080);
         self.verify_secs = self.verify_secs.clamp(3, 120);
         self.connect_timeout_secs = self.connect_timeout_secs.clamp(5, 600);
         self.settle_secs = self.settle_secs.clamp(0, 600);

@@ -24,6 +24,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::{intent::now_secs, net, paths};
 
+/// Estimated cost of a connect to a server we have measured but never
+/// actually connected to, in milliseconds.
+///
+/// Sits between a good measured connect (~3s) and a bad one (~20s) on
+/// purpose: a server proven fast should beat an unknown, and a server
+/// proven slow should lose to trying an unknown.
+const UNMEASURED_CONNECT_MS: f64 = 5_000.0;
+
+/// Estimated cost for a server we know nothing about at all.
+const UNKNOWN_CONNECT_MS: f64 = 15_000.0;
+
 /// What we know about one server on one network.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -126,15 +137,28 @@ impl ServerRecord {
         // whose handshake is quick but which takes five attempts to accept
         // a tunnel costs the user 22 seconds, and no handshake timing shows
         // that.
+        // Everything below is an ESTIMATE OF CONNECT TIME IN MILLISECONDS.
+        //
+        // Getting that unit wrong is not cosmetic. The first version used
+        // `latency * 4` as the fallback, which put unmeasured servers on a
+        // completely different scale: a 10ms handshake scored 40, while a
+        // server PROVEN to connect reliably in 2 seconds scored 2000. Every
+        // unmeasured server therefore outranked every proven one, forever,
+        // and the memory could never influence anything.
         let base = match (self.connect_ms, self.latency_ms) {
+            // Measured. The real thing, no estimate needed.
             (Some(ms), _) => ms as f64,
-            // No connect on record: fall back to handshake latency, scaled
-            // so the two are roughly comparable. A handshake is a few
-            // hundred ms; a connect is a few seconds.
-            (None, Some(ms)) => ms as f64 * 4.0,
-            // Never measured at all: worse than any plausible measurement,
-            // but finite, so it still ranks above a known-bad server.
-            (None, None) => 40_000.0,
+
+            // Never connected here, but measured. Estimate: the floor a
+            // good connect costs on these networks, plus a latency term.
+            // Deliberately ABOVE a good measured connect (~3s) and BELOW a
+            // bad one (~20s), so a proven-fast server wins and a
+            // proven-slow one loses to trying something new.
+            (None, Some(ms)) => UNMEASURED_CONNECT_MS + ms as f64 * 2.0,
+
+            // Nothing known at all: worse than any plausible estimate, but
+            // finite, so it still ranks above a known-bad server.
+            (None, None) => UNKNOWN_CONNECT_MS,
         };
         let intercept_penalty = if self.intercepted { 5_000.0 } else { 0.0 };
         let failure_multiplier = match self.success_rate() {
@@ -414,14 +438,24 @@ impl NetworkMemory {
                 .unwrap_or(10_000.0);
             base * priors.get(s).map(RealmPrior::weight).unwrap_or(1.0)
         };
+        // Stable sort, and NO name tie-break.
+        //
+        // Sorting equal scores by name looked harmlessly deterministic and
+        // was not: with an empty memory every server scores the same, so
+        // the list came out alphabetical and `pvpn up` connected to
+        // CA-FREE#... every time. That is where "it picks a random CA
+        // server" came from - it was not random, it was the alphabet.
+        //
+        // `candidates` arrives already ordered by the scanner's measured
+        // TLS latency. Rust's sort_by is stable, so leaving ties alone
+        // preserves that order, which is exactly the right fallback: when
+        // we know nothing extra, trust the measurement we just took.
         usable.sort_by(|a, b| {
             score_of(a)
                 .partial_cmp(&score_of(b))
-                // Scores are finite by construction, but a NaN here would
-                // silently scramble the order rather than panicking, so
-                // fall back to name order for determinism.
+                // Scores are finite by construction; a NaN must not scramble
+                // the order, so treat it as a tie and keep input order.
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.cmp(b))
         });
         usable.into_iter().cloned().collect()
     }
@@ -637,13 +671,70 @@ mod tests {
         assert_eq!(order.len(), 2, "must fall back rather than strand the user");
     }
 
+    /// With nothing learned, every server scores the same - and the order
+    /// that survives must be the SCANNER'S, which is measured latency.
+    ///
+    /// Sorting ties by name instead made `pvpn up` pick CA-FREE#... every
+    /// single time on a fresh network, because C sorts early. That was
+    /// reported as "it connects to a random CA server"; it was not random.
     #[test]
-    fn ranking_is_deterministic_for_equal_scores() {
+    fn equal_scores_keep_the_scanners_order() {
         let m = NetworkMemory::default();
-        let c: Vec<String> = vec!["Z".into(), "A".into(), "M".into()];
-        assert_eq!(m.rank(&c, 24), m.rank(&c, 24));
-        // Unknown servers all score the same, so name order breaks the tie.
-        assert_eq!(m.rank(&c, 24), vec!["A", "M", "Z"]);
+        let scanner_order: Vec<String> =
+            vec!["SG-FREE#20".into(), "JP-FREE#3".into(), "CA-FREE#7".into()];
+        assert_eq!(
+            m.rank(&scanner_order, 24),
+            scanner_order,
+            "an empty memory must not reorder a measured list"
+        );
+        // Still deterministic, just not alphabetical.
+        assert_eq!(m.rank(&scanner_order, 24), m.rank(&scanner_order, 24));
+    }
+
+    /// ...but real evidence still overrides the scanner's order.
+    #[test]
+    fn evidence_beats_scanner_order() {
+        let mut m = NetworkMemory::default();
+        let scanner_order: Vec<String> = vec!["untried-quick".into(), "proven".into()];
+        m.record_latency("untried-quick", 10, false);
+        m.record_latency("proven", 400, false);
+        m.record_success("proven");
+        m.record_connect_time("proven", 2_000);
+
+        assert_eq!(
+            m.rank(&scanner_order, 24)[0],
+            "proven",
+            "a server proven to connect in 2s must beat an untried one"
+        );
+    }
+
+    /// The units must match, or the memory can never influence anything.
+    ///
+    /// The first scoring used `latency * 4` for unmeasured servers, mixing
+    /// handshake milliseconds with full-connect milliseconds: a 10ms
+    /// handshake scored 40 against 2000 for a server proven to connect in
+    /// two seconds. Every unmeasured server outranked every proven one.
+    #[test]
+    fn measured_and_estimated_scores_share_a_scale() {
+        let mut proven_fast = ServerRecord::default();
+        proven_fast.connect_ms = Some(3_000);
+        proven_fast.ok = 3;
+
+        let mut proven_slow = ServerRecord::default();
+        proven_slow.connect_ms = Some(20_000);
+        proven_slow.ok = 3;
+
+        let mut untried = ServerRecord::default();
+        untried.latency_ms = Some(100);
+
+        assert!(
+            proven_fast.score() < untried.score(),
+            "a proven-fast server must beat an untried one"
+        );
+        assert!(
+            untried.score() < proven_slow.score(),
+            "an untried server must beat one proven to take 20 seconds"
+        );
     }
 
     /// Only servers that have actually connected here count as evidence.

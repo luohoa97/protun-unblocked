@@ -272,7 +272,8 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
             .filter(|t| !args.exclude.iter().any(|x| x == t))
             .collect()
     } else {
-        let candidates = timing.mark("scan", || scan_candidates(cfg, &args, &network))?;
+        let candidates =
+            timing.mark("scan", || scan_candidates(cfg, &args, &network, &mut memory))?;
         // Weight by what other sites on this SSID have learned. On a
         // department-wide network like a school, the filter policy is the
         // same everywhere but each building has its own gateway - so a
@@ -682,7 +683,12 @@ fn settled(window: Duration) -> Option<Duration> {
 /// timing is worthless here (a middlebox completes the TCP handshake
 /// locally and reports 1.6ms to a US server from Australia). Rewriting a
 /// working, well-reasoned measurement tool would be motion, not progress.
-fn scan_candidates(cfg: &Config, args: &UpArgs, network: &str) -> Result<Vec<String>> {
+fn scan_candidates(
+    cfg: &Config,
+    args: &UpArgs,
+    network: &str,
+    memory: &mut NetworkMemory,
+) -> Result<Vec<String>> {
     let scanner = proton::shim_dir().join("pvpn-scan.py");
     if !scanner.is_file() {
         eprintln!("scanner missing at {} - re-run setup.sh", scanner.display());
@@ -696,12 +702,42 @@ fn scan_candidates(cfg: &Config, args: &UpArgs, network: &str) -> Result<Vec<Str
     ));
     let cache = paths::data_dir().join("scan").join(format!("{key}.json"));
 
-    if !args.rescan {
-        // Six hours, not one. Re-measuring a network that has not changed
-        // buys nothing and re-emits the loudest thing this tool does.
-        if let Some(names) = read_fresh_cache(&cache, 360) {
-            eprintln!("  using a recent scan of this network (--rescan to redo)");
-            return Ok(names);
+    // Re-measure automatically when the cache would only tell us things we
+    // have already learned are wrong.
+    //
+    // A cached scan is a list of latencies. If every server it names is now
+    // BLOCKED here, reusing it just re-picks servers we know do not work -
+    // which is what "up doesn't auto rescan" looked like from the outside.
+    // Evidence that contradicts the cache invalidates it.
+    let stale_by_evidence = {
+        let cached = read_fresh_cache(&cache, cfg.scan_ttl_mins)
+            .map(|t| parse_scan(&t))
+            .unwrap_or_default();
+        !cached.is_empty()
+            && cached.iter().all(|s| {
+                memory
+                    .servers
+                    .get(s)
+                    .map(|r| r.is_blocked(cfg.blocked_retry_after_hours, pvpn_core::intent::now_secs()))
+                    .unwrap_or(false)
+            })
+    };
+    if stale_by_evidence {
+        eprintln!("  every server in the last scan is blocked here - re-measuring");
+    }
+
+    if !args.rescan && !stale_by_evidence {
+        if let Some(text) = read_fresh_cache(&cache, cfg.scan_ttl_mins) {
+            let names = parse_scan(&text);
+            if !names.is_empty() {
+                eprintln!("  using a recent scan of this network (--rescan to redo)");
+                // Fold the CACHED measurements in too. Previously a cache
+                // hit returned names only, so a network whose scan was
+                // still fresh taught the ranking nothing at all - it went
+                // straight back to having no latencies to sort by.
+                record_scan(memory, &text);
+                return Ok(names);
+            }
         }
     }
 
@@ -738,28 +774,41 @@ fn scan_candidates(cfg: &Config, args: &UpArgs, network: &str) -> Result<Vec<Str
 
     if !names.is_empty() {
         let _ = paths::write_atomic(&cache, &text);
-        // Fold the measurements into what we know about this network, so a
-        // later `pvpn fast` reflects them and ranking has latency to work
-        // with.
-        let mut memory = NetworkMemory::load(network);
-        for entry in parse_scan_full(&text) {
-            memory.record_latency(&entry.0, entry.1, entry.2);
-        }
-        let _ = memory.save();
+        // Into the CALLER'S memory, not a private copy.
+        //
+        // This was the bug behind "it doesn't use the learnt network at
+        // all". scan_candidates used to load its own NetworkMemory, record
+        // the latencies and save - while cmd_up held a separate copy loaded
+        // BEFORE the scan. The ranking then ran against that stale copy
+        // (no latencies at all), and cmd_up's own save at the end
+        // overwrote the file, erasing every measurement the scan had just
+        // taken. Every scan learned, and was wiped, on every single `up`.
+        record_scan(memory, &text);
     }
-    let _ = cfg;
+    let _ = (cfg, network);
     Ok(names)
 }
 
-fn read_fresh_cache(path: &std::path::Path, max_age_mins: u64) -> Option<Vec<String>> {
+/// Fold a scanner JSON result into what we know about this network.
+fn record_scan(memory: &mut NetworkMemory, text: &str) {
+    for (name, ms, intercepted) in parse_scan_full(text) {
+        memory.record_latency(&name, ms, intercepted);
+    }
+}
+
+/// The cached scan, if it is recent enough to trust.
+///
+/// Returns the raw JSON, not just the names: the latencies in it are the
+/// whole reason the file exists, and a caller that only gets names cannot
+/// teach the ranking anything.
+fn read_fresh_cache(path: &std::path::Path, max_age_mins: u64) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
     let age = meta.modified().ok()?.elapsed().ok()?;
     if age > Duration::from_secs(max_age_mins * 60) {
         return None;
     }
     let text = std::fs::read_to_string(path).ok()?;
-    let names = parse_scan(&text);
-    (!names.is_empty()).then_some(names)
+    (!parse_scan(&text).is_empty()).then_some(text)
 }
 
 /// Server names from the scanner's JSON, in the order it ranked them.
