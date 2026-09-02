@@ -122,20 +122,39 @@ fn as_str(v: Option<&zbus::zvariant::OwnedValue>) -> Option<String> {
 /// Any vpn/wireguard profile counts, not just ones named "ProtonVPN":
 /// hopping leaves profiles named after bare server IPs.
 pub fn vpn_connection() -> Option<String> {
+    // Prefer an ACTIVATED tunnel over one merely present.
+    //
+    // Taking the first vpn-typed connection was wrong: Proton can leave a
+    // deactivating profile in the list while the new one comes up, so
+    // `pvpn down` reported "Disconnected from CA-FREE#23" while the machine
+    // was actually on SG-FREE#5. Naming the wrong server is not cosmetic -
+    // it is what gets recorded against the ranking.
+    let mut fallback = None;
     for path in active_connection_paths() {
         let Some(props) = all_properties(&path) else {
             continue;
         };
-        match as_str(props.get("Type")).as_deref() {
-            Some("vpn") | Some("wireguard") => {
-                if let Some(id) = as_str(props.get("Id")) {
-                    return Some(id);
-                }
-            }
-            _ => {}
+        if !matches!(
+            as_str(props.get("Type")).as_deref(),
+            Some("vpn") | Some("wireguard")
+        ) {
+            continue;
         }
+        let Some(id) = as_str(props.get("Id")) else {
+            continue;
+        };
+        // NMActiveConnectionState 2 = ACTIVATED.
+        let activated = props
+            .get("State")
+            .and_then(|v| u32::try_from(v).ok())
+            .map(|s| s == 2)
+            .unwrap_or(false);
+        if activated {
+            return Some(id);
+        }
+        fallback.get_or_insert(id);
     }
-    None
+    fallback
 }
 
 /// Everything active, as `(path, type, id)`. One round trip per connection.

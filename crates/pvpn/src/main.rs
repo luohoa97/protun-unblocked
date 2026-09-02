@@ -121,8 +121,23 @@ struct UpFlags {
     /// Unlike --server, this is a preference with a safety net. pvpnd uses
     /// it to reconnect to whatever was working before a drop rather than
     /// re-ranking from scratch and landing somewhere new.
+    ///
+    /// NOT --prefer: that is the ranking mode, and reusing the name made
+    /// `--prefer latency` try to connect to a server called "latency".
     #[arg(long, value_name = "SERVER")]
-    prefer: Option<String>,
+    first: Option<String>,
+
+    /// How to rank what the scanner measures.
+    #[arg(long, value_name = "MODE", default_value = "balanced")]
+    prefer: connect::RankMode,
+
+    /// Shorthand for --prefer latency.
+    #[arg(long, conflicts_with = "prefer")]
+    latency: bool,
+
+    /// Shorthand for --prefer load.
+    #[arg(long, conflicts_with_all = ["prefer", "latency"])]
+    load: bool,
 
     /// Pin a protocol instead of letting the network decide.
     #[arg(short, long)]
@@ -167,7 +182,14 @@ impl UpFlags {
     fn into_args(self, hop: bool) -> connect::UpArgs {
         connect::UpArgs {
             explicit: self.server.clone(),
-            prefer: self.prefer.clone(),
+            first: self.first.clone(),
+            rank: if self.latency {
+                connect::RankMode::Latency
+            } else if self.load {
+                connect::RankMode::Load
+            } else {
+                self.prefer
+            },
             filter: self.filter(),
             protocol: self.protocol.clone(),
             exclude: self.exclude.clone(),
@@ -473,7 +495,16 @@ mod tests {
             &["pvpn", "up", "--verify"],
             &["pvpn", "up", "--not", "SG-FREE#12"],
             &["pvpn", "up", "--attempts", "5"],
-            &["pvpn", "up", "--prefer", "SG-FREE#20"],
+            &["pvpn", "up", "--first", "SG-FREE#20"],
+            // The ranking mode - a documented flag that a server-name
+            // preference must never shadow.
+            &["pvpn", "up", "--prefer", "latency"],
+            &["pvpn", "up", "--prefer", "load"],
+            &["pvpn", "up", "--prefer", "balanced"],
+            &["pvpn", "up", "--latency"],
+            &["pvpn", "up", "--load"],
+            &["pvpn", "up", "--rescan", "--verify", "--prefer", "latency"],
+            &["pvpn", "up", "--rescan", "--verify", "--prefer", "latency", "-c", "SG", "-c", "JP"],
             &["pvpn", "down"],
             &["pvpn", "disconnect"],
             &["pvpn", "hop"],
@@ -510,6 +541,10 @@ mod tests {
             vec!["pvpn", "not-a-command"],
             vec!["pvpn", "up", "--not-a-flag"],
             vec!["pvpn", "up", "--attempts", "banana"],
+            // A ranking mode that does not exist must be REJECTED, not
+            // quietly treated as a server name and connected to.
+            vec!["pvpn", "up", "--prefer", "SG-FREE#20"],
+            vec!["pvpn", "up", "--prefer", "nonsense"],
         ] {
             assert!(
                 Cli::try_parse_from(&argv).is_err(),

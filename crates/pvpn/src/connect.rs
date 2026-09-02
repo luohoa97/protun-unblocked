@@ -33,6 +33,48 @@ use pvpn_core::{
     net, paths, probe, proton, Intent,
 };
 
+/// How the scanner orders what it measures.
+///
+/// A real, documented option that predates this rewrite - the scanner
+/// implements all three in `score()`. It is part of the scan cache key,
+/// because the same servers ranked by latency and by load are different
+/// answers and serving one from the other's cache silently ignores the
+/// preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RankMode {
+    /// The measured handshake alone.
+    Latency,
+    /// How busy the server is, latency only breaking ties.
+    Load,
+    #[default]
+    Balanced,
+}
+
+impl RankMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RankMode::Latency => "latency",
+            RankMode::Load => "load",
+            RankMode::Balanced => "balanced",
+        }
+    }
+}
+
+impl std::str::FromStr for RankMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "latency" => Ok(RankMode::Latency),
+            "load" => Ok(RankMode::Load),
+            "balanced" | "score" => Ok(RankMode::Balanced),
+            other => Err(format!(
+                "unknown ranking '{other}' - use latency, load or balanced.\n\
+                 (to pin a SERVER, use --server NAME or --first NAME)"
+            )),
+        }
+    }
+}
+
 pub struct UpArgs {
     /// Servers named outright with `-s/--server`.
     ///
@@ -50,7 +92,16 @@ pub struct UpArgs {
     /// daemon: after a drop, the server that was working thirty seconds ago
     /// is the strongest evidence available. Reconnecting by re-ranking from
     /// scratch throws that away and can land on one the filter kills.
-    pub prefer: Option<String>,
+    ///
+    /// This was briefly called `--prefer`, which COLLIDED with the existing
+    /// `--prefer latency|load|balanced` ranking mode. `pvpn up --prefer
+    /// latency` then put the literal string "latency" at the head of the
+    /// target list, steering matched no server, and Proton picked freely -
+    /// silently ignoring `--country` along with everything else.
+    pub first: Option<String>,
+
+    /// How the scanner should rank: `latency`, `load` or `balanced`.
+    pub rank: RankMode,
     pub filter: Option<String>,
     pub protocol: Option<String>,
     pub exclude: Vec<String>,
@@ -72,7 +123,8 @@ impl Default for UpArgs {
     fn default() -> Self {
         Self {
             explicit: Vec::new(),
-            prefer: None,
+            first: None,
+            rank: RankMode::Balanced,
             filter: None,
             protocol: None,
             exclude: Vec::new(),
@@ -296,7 +348,7 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
             .collect()
     };
 
-    targets = with_preferred(targets, args.prefer.as_deref(), &args.exclude);
+    targets = with_preferred(targets, args.first.as_deref(), &args.exclude);
 
     if targets.is_empty() && !args.no_scan {
         if args.filter.is_some() {
@@ -394,6 +446,33 @@ pub fn cmd_up(cfg: &Config, mut args: UpArgs) -> Result<u8> {
                 };
 
                 let elapsed = started.elapsed();
+
+                // Did we actually land where we asked?
+                //
+                // Steering happens by hiding the other servers in Proton's
+                // own cache (PVPN_ONLY, via the sitecustomize shim). When
+                // the name matches nothing, Proton does not fail - it picks
+                // whatever it likes, and you silently end up in another
+                // country. That is exactly how `--prefer latency` connected
+                // to CA-FREE#23 while asking for SG and JP.
+                //
+                // Credit the server we are ACTUALLY on, never the one we
+                // asked for, or the memory learns fiction.
+                let landed = where_.clone();
+                let target = match (target, landed.as_deref()) {
+                    (Some(want), Some(got)) if want != got => {
+                        eprintln!();
+                        eprintln!("WARNING: asked for {want}, landed on {got}.");
+                        eprintln!("  Server steering did not take effect. Check that the shim at");
+                        eprintln!("  {} is current:  ./setup.sh", proton::shim_dir().display());
+                        Some(got.to_string())
+                    }
+                    (Some(want), _) => Some(want.clone()),
+                    (None, Some(got)) => Some(got.to_string()),
+                    (None, None) => None,
+                };
+                let target = target.as_ref();
+
                 match (target, verified) {
                     // Proven: credit it, and time it to VERIFIED rather
                     // than to "tunnel exists", because that is when it
@@ -695,10 +774,14 @@ fn scan_candidates(
         return Ok(Vec::new());
     }
 
+    // The ranking mode is part of the key: the same servers ordered by
+    // latency and by load are different answers, and serving one from the
+    // other's cache silently ignores the preference you set.
     let key = net::sanitise(&format!(
-        "{}@{}",
+        "{}@{}@{}",
         args.filter.as_deref().unwrap_or("_any"),
-        network
+        network,
+        args.rank.as_str()
     ));
     let cache = paths::data_dir().join("scan").join(format!("{key}.json"));
 
@@ -747,7 +830,9 @@ fn scan_candidates(
     if let Some(f) = &args.filter {
         cmd.arg(f);
     }
-    cmd.arg("--json")
+    cmd.arg("--rank")
+        .arg(args.rank.as_str())
+        .arg("--json")
         // Deliberately gentle. The scanner's default was 24 concurrent
         // probes; across ~70 candidates at 2 samples each that is ~140 TLS
         // handshakes into one provider's address space in a few seconds,
@@ -755,11 +840,12 @@ fn scan_candidates(
         // tunnel it is choosing - a tunnel is one long-lived TLS session on
         // 443 and looks like any other HTTPS connection.
         //
-        // Six at a time takes longer and is worth it: the whole point of
-        // the memory is that this runs rarely, so its speed matters much
-        // less than what it looks like when it does.
+        // Twelve, not the stock 24 and not the 6 this was briefly set to.
+        // Six made a full 80-server scan take THIRTY SECONDS, which is long
+        // enough that the scan gets Ctrl-C'd - and a scan nobody waits for
+        // teaches nothing, which costs more than the noise it saved.
         .arg("--workers")
-        .arg("6")
+        .arg("12")
         .env("PYTHONPATH", proton::shim_dir())
         .stderr(Stdio::inherit());
 
@@ -881,6 +967,41 @@ mod tests {
     fn no_preference_leaves_the_ranking_alone() {
         let ranked = vec!["A".to_string(), "B".to_string()];
         assert_eq!(with_preferred(ranked.clone(), None, &[]), ranked);
+    }
+
+    /// THE collision. `--prefer` has always meant the ranking mode, and a
+    /// server name must be REJECTED rather than accepted and connected to.
+    ///
+    /// Accepting one is what made `pvpn up --prefer latency` put the string
+    /// "latency" at the head of the target list, match no server, and let
+    /// Proton pick CA-FREE#23 while `--country SG,JP` was silently ignored.
+    #[test]
+    fn rank_modes_parse_and_server_names_do_not() {
+        use std::str::FromStr;
+        assert_eq!(RankMode::from_str("latency").unwrap(), RankMode::Latency);
+        assert_eq!(RankMode::from_str("load").unwrap(), RankMode::Load);
+        assert_eq!(RankMode::from_str("balanced").unwrap(), RankMode::Balanced);
+        assert_eq!(RankMode::from_str("LATENCY").unwrap(), RankMode::Latency);
+        // The scanner's own name for balanced.
+        assert_eq!(RankMode::from_str("score").unwrap(), RankMode::Balanced);
+
+        let err = RankMode::from_str("SG-FREE#20").unwrap_err();
+        assert!(err.contains("latency"), "must list the valid modes");
+        assert!(
+            err.contains("--server") && err.contains("--first"),
+            "must point at the flag the user actually wanted: {err}"
+        );
+        assert!(RankMode::from_str("nonsense").is_err());
+    }
+
+    /// The mode is part of the cache key. Serving a latency-ranked scan
+    /// when load was asked for silently ignores the preference.
+    #[test]
+    fn rank_modes_have_distinct_keys() {
+        let mut seen = std::collections::HashSet::new();
+        for m in [RankMode::Latency, RankMode::Load, RankMode::Balanced] {
+            assert!(seen.insert(m.as_str()));
+        }
     }
 
     #[test]

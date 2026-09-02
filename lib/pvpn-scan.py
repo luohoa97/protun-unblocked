@@ -193,7 +193,7 @@ def main():
     # IP blocklisted for everyone who shares it. pvpn now scans rarely
     # (it remembers what a network taught it), so this being slower is a
     # good trade.
-    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--top", type=int, default=10)
     ap.add_argument("--rank", "--prefer", dest="rank",
                     choices=("balanced", "score", "latency", "load"),
